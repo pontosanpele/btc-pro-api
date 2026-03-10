@@ -57,10 +57,6 @@ def as_float(value: Any) -> Optional[float]:
         return None
 
 
-def as_list(value: Any) -> List[Any]:
-    return value if isinstance(value, list) else []
-
-
 def fmt_num(value: Any, digits: int = 2) -> str:
     num = as_float(value)
     if num is None:
@@ -68,125 +64,346 @@ def fmt_num(value: Any, digits: int = 2) -> str:
     return f"{num:.{digits}f}"
 
 
-def fmt_pct(value: Any, digits: int = 2) -> str:
-    num = as_float(value)
-    if num is None:
-        return "-"
-    return f"{num:.{digits}f}%"
+def zone_text(zone: Any) -> str:
+    if isinstance(zone, list) and len(zone) >= 2:
+        return f"{fmt_num(zone[0])} - {fmt_num(zone[1])}"
+    return "-"
+
+
+def first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def to_bool(value: Any) -> bool:
+    return bool(value)
 
 
 # -----------------------------
-# Report extraction
+# Next-15 report logic
 # -----------------------------
-def build_next15_report(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    btc = snapshot.get("btc", {})
-    trade_report = btc.get("trade_report", {}) if isinstance(btc.get("trade_report"), dict) else {}
-
-    ts = snapshot.get("ts_bucharest")
-    last = btc.get("last")
-    market_regime = btc.get("market_regime")
-    market_bias = btc.get("market_bias")
-    market_read = btc.get("market_read")
-    trend_5m = btc.get("trend_5m")
+def _dominant_bias_from_htf(btc: Dict[str, Any]) -> str:
     trend_15m = btc.get("trend_15m")
     trend_1h = btc.get("trend_1h")
-    summary_status = btc.get("summary_status")
-    final_action = btc.get("final_action_v4") or btc.get("final_action_v3") or btc.get("final_action")
-    final_side = btc.get("final_side_v4") or btc.get("final_side_v3") or btc.get("final_side")
-    retest_winner = btc.get("retest_winner_side")
+    trend_4h = btc.get("htf_4h_trend")
+    market_bias = btc.get("market_bias")
+    market_regime = btc.get("market_regime") or ""
 
-    # Current next-15 bias
-    bias = "neutral"
-    if final_side in {"long", "short"}:
-        bias = final_side
-    elif retest_winner in {"long", "short"}:
-        bias = retest_winner
-    elif market_bias in {"long", "short"}:
-        bias = market_bias
+    up_votes = 0
+    down_votes = 0
 
-    long_ready = bool(btc.get("retest_long_ready") or btc.get("long_path_valid"))
-    short_ready = bool(btc.get("retest_short_ready") or btc.get("short_path_valid"))
+    if trend_1h == "up":
+        up_votes += 3
+    elif trend_1h == "down":
+        down_votes += 3
 
-    long_entry_zone = trade_report.get("long_entry_zone") or btc.get("long_entry_zone") or btc.get("trade_plan_entry_zone")
-    short_entry_zone = trade_report.get("short_entry_zone") or btc.get("short_entry_zone")
-
-    long_sl = trade_report.get("long_sl") or btc.get("trade_plan_stop") or btc.get("atr_stop_long") or btc.get("invalidation_long")
-    short_sl = trade_report.get("short_sl") or btc.get("trade_plan_stop") or btc.get("atr_stop_short") or btc.get("invalidation_short")
-
-    long_tp1 = trade_report.get("long_tp1") or btc.get("trade_plan_t1") or btc.get("target_long_1")
-    long_tp2 = trade_report.get("long_tp2") or btc.get("trade_plan_t2") or btc.get("target_long_2")
-    short_tp1 = trade_report.get("short_tp1") or btc.get("target_short_1")
-    short_tp2 = trade_report.get("short_tp2") or btc.get("target_short_2")
-
-    bull_trigger = btc.get("bull_trigger_price")
-    bear_trigger = btc.get("bear_trigger_price")
-
-    reasons: List[str] = []
-    if bias == "long":
-        if long_ready:
-            reasons.append("long_retest_ready")
-        if market_regime:
-            reasons.append(f"regime:{market_regime}")
+    if trend_15m == "up":
+        up_votes += 2
+    elif trend_15m == "down":
+        down_votes += 2
+    elif trend_15m == "range":
         if trend_1h == "up":
-            reasons.append("1h_uptrend")
-        if btc.get("wall_pressure_side") == "bid":
-            reasons.append("bid_wall_support")
-        if btc.get("retest_long_score") is not None:
-            reasons.append(f"long_retest_score:{fmt_num(btc.get('retest_long_score'))}")
-    elif bias == "short":
-        if short_ready:
-            reasons.append("short_retest_ready")
-        if market_regime:
-            reasons.append(f"regime:{market_regime}")
-        if trend_1h == "down":
-            reasons.append("1h_downtrend")
-        if btc.get("wall_pressure_side") == "ask":
-            reasons.append("ask_wall_pressure")
-        if btc.get("retest_short_score") is not None:
-            reasons.append(f"short_retest_score:{fmt_num(btc.get('retest_short_score'))}")
+            up_votes += 1
+        elif trend_1h == "down":
+            down_votes += 1
+
+    if trend_4h == "up":
+        up_votes += 2
+    elif trend_4h == "down":
+        down_votes += 2
+
+    if market_bias == "long":
+        up_votes += 1
+    elif market_bias == "short":
+        down_votes += 1
+
+    if "long" in market_regime or "impulse_up" in market_regime or "trend_build_long" in market_regime:
+        up_votes += 1
+    if "short" in market_regime or "impulse_down" in market_regime or "trend_build_short" in market_regime:
+        down_votes += 1
+
+    if up_votes >= down_votes + 2:
+        return "long"
+    if down_votes >= up_votes + 2:
+        return "short"
+    return "neutral"
+
+
+def _execution_bias_from_ltf(btc: Dict[str, Any]) -> str:
+    final_side = btc.get("final_side_v4") or btc.get("final_side_v3") or btc.get("final_side_v2") or btc.get("final_side")
+    retest_winner = btc.get("retest_winner_side")
+    trend_5m = btc.get("trend_5m")
+    raw_bias = btc.get("trade_bias") or btc.get("trading_bias")
+
+    long_score = 0
+    short_score = 0
+
+    if final_side == "long":
+        long_score += 3
+    elif final_side == "short":
+        short_score += 3
+
+    if retest_winner == "long":
+        long_score += 2
+    elif retest_winner == "short":
+        short_score += 2
+
+    if trend_5m == "up":
+        long_score += 1
+    elif trend_5m == "down":
+        short_score += 1
+
+    if raw_bias == "long":
+        long_score += 1
+    elif raw_bias == "short":
+        short_score += 1
+
+    if long_score >= short_score + 2:
+        return "long"
+    if short_score >= long_score + 2:
+        return "short"
+    return "neutral"
+
+
+def _bias_stability_score(btc: Dict[str, Any], dominant_bias: str, execution_bias: str) -> float:
+    score = 40.0
+    persistence = as_float(btc.get("bias_persistence_count")) or 0.0
+    regime_persistence = as_float(btc.get("regime_persistence_count")) or 0.0
+    stability = as_float(btc.get("decision_stability_score")) or 0.0
+    conflict = as_float(btc.get("signal_conflict_score")) or 0.0
+
+    score += min(persistence * 8.0, 24.0)
+    score += min(regime_persistence * 4.0, 12.0)
+    score += min(stability * 0.22, 20.0)
+    score -= min(conflict * 0.30, 20.0)
+
+    if dominant_bias != "neutral" and dominant_bias == execution_bias:
+        score += 10.0
+    elif dominant_bias != "neutral" and execution_bias not in ("neutral", dominant_bias):
+        score -= 12.0
+
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def _next15_bias(btc: Dict[str, Any]) -> Dict[str, Any]:
+    dominant_bias = _dominant_bias_from_htf(btc)
+    execution_bias = _execution_bias_from_ltf(btc)
+    prev_bias = btc.get("prev_trade_bias")
+    bias_persistence = int(as_float(btc.get("bias_persistence_count")) or 0)
+
+    long_ready = to_bool(btc.get("retest_long_ready") or btc.get("long_path_valid"))
+    short_ready = to_bool(btc.get("retest_short_ready") or btc.get("short_path_valid"))
+    long_score = as_float(btc.get("retest_long_score")) or 0.0
+    short_score = as_float(btc.get("retest_short_score")) or 0.0
+    long_consensus = as_float(btc.get("direction_consensus_long_score")) or 0.0
+    short_consensus = as_float(btc.get("direction_consensus_short_score")) or 0.0
+
+    if dominant_bias == "long":
+        if short_ready and execution_bias == "short" and short_score >= long_score + 18 and short_consensus >= long_consensus + 15 and bias_persistence >= 2:
+            final_bias = "short"
+        else:
+            final_bias = "long"
+    elif dominant_bias == "short":
+        if long_ready and execution_bias == "long" and long_score >= short_score + 18 and long_consensus >= short_consensus + 15 and bias_persistence >= 2:
+            final_bias = "long"
+        else:
+            final_bias = "short"
     else:
-        if market_regime:
-            reasons.append(f"regime:{market_regime}")
-        reasons.append("mixed_or_unclear_flow")
+        if execution_bias in ("long", "short"):
+            final_bias = execution_bias
+        elif long_ready and long_score >= short_score + 12:
+            final_bias = "long"
+        elif short_ready and short_score >= long_score + 12:
+            final_bias = "short"
+        else:
+            final_bias = "neutral"
 
-    confidence_candidates = [
-        btc.get("trade_plan_confidence"),
-        btc.get("confidence_score"),
-        btc.get("confidence_score_v2"),
-    ]
-    confidence = next((round(as_float(x), 2) for x in confidence_candidates if as_float(x) is not None), None)
+    flip_cooldown_active = False
+    if prev_bias in ("long", "short") and final_bias in ("long", "short") and prev_bias != final_bias:
+        if bias_persistence < 2 and dominant_bias not in ("neutral", final_bias):
+            final_bias = prev_bias
+            flip_cooldown_active = True
 
-    verdict = "neutral / watch"
-    if bias == "long":
-        verdict = "long oldal előnyben a következő ~15 percre"
-        if not long_ready:
-            verdict = "enyhe long előny, de még nincs kész trigger"
-    elif bias == "short":
-        verdict = "short oldal előnyben a következő ~15 percre"
-        if not short_ready:
-            verdict = "enyhe short előny, de még nincs kész trigger"
+    stability = _bias_stability_score(btc, dominant_bias, execution_bias)
+    flip_risk = round(max(0.0, min(100.0, 100.0 - stability)), 2)
+
+    return {
+        "dominant_bias_1h_15m": dominant_bias,
+        "execution_bias_5m": execution_bias,
+        "next_15m_bias": final_bias,
+        "bias_stability": stability,
+        "bias_flip_risk": flip_risk,
+        "flip_cooldown_active": flip_cooldown_active,
+    }
+
+
+def _bias_confidence(btc: Dict[str, Any], bias_meta: Dict[str, Any]) -> Optional[float]:
+    dominant = bias_meta.get("dominant_bias_1h_15m")
+    execution = bias_meta.get("execution_bias_5m")
+    final_bias = bias_meta.get("next_15m_bias")
+
+    score = 0.0
+    if final_bias == "neutral":
+        score = 42.0
+    else:
+        score = 50.0
+        if dominant == final_bias:
+            score += 12.0
+        if execution == final_bias:
+            score += 8.0
+
+        if final_bias == "long":
+            score += min((as_float(btc.get("retest_long_score")) or 0.0) * 0.16, 14.0)
+            score += min((as_float(btc.get("direction_consensus_long_score")) or 0.0) * 0.10, 10.0)
+        elif final_bias == "short":
+            score += min((as_float(btc.get("retest_short_score")) or 0.0) * 0.16, 14.0)
+            score += min((as_float(btc.get("direction_consensus_short_score")) or 0.0) * 0.10, 10.0)
+
+        score += min((as_float(btc.get("volume_quality_score")) or 0.0) * 0.10, 8.0)
+        score += min((as_float(bias_meta.get("bias_stability")) or 0.0) * 0.10, 10.0)
+
+        if bias_meta.get("flip_cooldown_active"):
+            score -= 8.0
+
+        if btc.get("signal_conflict_score") is not None:
+            score -= min((as_float(btc.get("signal_conflict_score")) or 0.0) * 0.18, 14.0)
+
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def _verdict_and_reasons(btc: Dict[str, Any], bias_meta: Dict[str, Any]) -> Dict[str, Any]:
+    final_bias = bias_meta.get("next_15m_bias")
+    dominant = bias_meta.get("dominant_bias_1h_15m")
+    execution = bias_meta.get("execution_bias_5m")
+    reasons: List[str] = []
+
+    market_regime = btc.get("market_regime")
+    if market_regime:
+        reasons.append(f"regime:{market_regime}")
+
+    if dominant == "long":
+        reasons.append("1h_15m_főirány:long")
+    elif dominant == "short":
+        reasons.append("1h_15m_főirány:short")
+    else:
+        reasons.append("1h_15m_főirány:semleges")
+
+    if execution == "long":
+        reasons.append("5m_execution:long")
+    elif execution == "short":
+        reasons.append("5m_execution:short")
+    else:
+        reasons.append("5m_execution:semleges")
+
+    if final_bias == "long":
+        if btc.get("retest_long_ready"):
+            reasons.append("long_retest_ready")
+        if btc.get("trend_1h") == "up":
+            reasons.append("1h_trend_up")
+        if btc.get("wall_pressure_side") == "bid":
+            reasons.append("bid_támasz")
+    elif final_bias == "short":
+        if btc.get("retest_short_ready"):
+            reasons.append("short_retest_ready")
+        if btc.get("trend_1h") == "down":
+            reasons.append("1h_trend_down")
+        if btc.get("wall_pressure_side") == "ask":
+            reasons.append("ask_nyomás")
+
+    if bias_meta.get("flip_cooldown_active"):
+        reasons.append("flip_cooldown")
+
+    verdict = "semleges / kivárás"
+    if final_bias == "long":
+        if dominant == "long" and execution in ("neutral", "long"):
+            verdict = "főirány long, a következő 15 percben is inkább long előny"
+        elif dominant == "long" and execution == "short":
+            verdict = "HTF long, most inkább visszahúzás; nem teljes irányváltás"
+        else:
+            verdict = "enyhe long előny, de még kell megerősítés"
+    elif final_bias == "short":
+        if dominant == "short" and execution in ("neutral", "short"):
+            verdict = "főirány short, a következő 15 percben is inkább short előny"
+        elif dominant == "short" and execution == "long":
+            verdict = "HTF short, most inkább felpattanás; nem teljes irányváltás"
+        else:
+            verdict = "enyhe short előny, de még kell megerősítés"
+
+    return {
+        "next_15m_verdict": verdict,
+        "reasons": reasons[:6],
+    }
+
+
+def build_next15_report(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    btc = snapshot.get("btc", {}) if isinstance(snapshot.get("btc"), dict) else {}
+    trade_report = btc.get("trade_report", {}) if isinstance(btc.get("trade_report"), dict) else {}
+
+    bias_meta = _next15_bias(btc)
+    verdict_meta = _verdict_and_reasons(btc, bias_meta)
+    confidence = _bias_confidence(btc, bias_meta)
+
+    long_entry_zone = first_not_none(
+        trade_report.get("long_entry_zone"),
+        btc.get("trade_plan_entry_zone") if btc.get("trade_plan_side") == "long" else None,
+        btc.get("long_entry_zone"),
+    )
+    short_entry_zone = first_not_none(
+        trade_report.get("short_entry_zone"),
+        btc.get("trade_plan_entry_zone") if btc.get("trade_plan_side") == "short" else None,
+        btc.get("short_entry_zone"),
+    )
+
+    long_sl = first_not_none(
+        trade_report.get("long_sl"),
+        btc.get("trade_plan_stop") if btc.get("trade_plan_side") == "long" else None,
+        btc.get("atr_stop_long"),
+        btc.get("invalidation_long"),
+    )
+    short_sl = first_not_none(
+        trade_report.get("short_sl"),
+        btc.get("trade_plan_stop") if btc.get("trade_plan_side") == "short" else None,
+        btc.get("atr_stop_short"),
+        btc.get("invalidation_short"),
+    )
+
+    long_tp1 = first_not_none(trade_report.get("long_tp1"), btc.get("trade_plan_t1"), btc.get("target_long_1"))
+    long_tp2 = first_not_none(trade_report.get("long_tp2"), btc.get("trade_plan_t2"), btc.get("target_long_2"))
+    short_tp1 = first_not_none(trade_report.get("short_tp1"), btc.get("target_short_1"))
+    short_tp2 = first_not_none(trade_report.get("short_tp2"), btc.get("target_short_2"))
+
+    long_ready = to_bool(btc.get("retest_long_ready") or btc.get("long_path_valid") or btc.get("trade_plan_side") == "long")
+    short_ready = to_bool(btc.get("retest_short_ready") or btc.get("short_path_valid") or btc.get("trade_plan_side") == "short")
 
     return {
         "generated_at_utc": utc_now_iso(),
-        "source_ts_bucharest": ts,
-        "price": last,
-        "next_15m_bias": bias,
+        "source_ts_bucharest": snapshot.get("ts_bucharest"),
+        "price": btc.get("last"),
+        "next_15m_bias": bias_meta.get("next_15m_bias"),
         "next_15m_confidence": confidence,
-        "next_15m_verdict": verdict,
-        "market_regime": market_regime,
-        "market_bias": market_bias,
-        "market_read": market_read,
-        "summary_status": summary_status,
-        "final_action": final_action,
+        "next_15m_verdict": verdict_meta.get("next_15m_verdict"),
+        "dominant_bias_1h_15m": bias_meta.get("dominant_bias_1h_15m"),
+        "execution_bias_5m": bias_meta.get("execution_bias_5m"),
+        "bias_stability": bias_meta.get("bias_stability"),
+        "bias_flip_risk": bias_meta.get("bias_flip_risk"),
+        "flip_cooldown_active": bias_meta.get("flip_cooldown_active"),
+        "market_regime": btc.get("market_regime"),
+        "market_bias": btc.get("market_bias"),
+        "market_read": btc.get("market_read"),
+        "summary_status": btc.get("summary_status"),
+        "final_action": first_not_none(btc.get("final_action_v4"), btc.get("final_action_v3"), btc.get("final_action_v2"), btc.get("final_action")),
         "trends": {
-            "trend_5m": trend_5m,
-            "trend_15m": trend_15m,
-            "trend_1h": trend_1h,
+            "trend_5m": btc.get("trend_5m"),
+            "trend_15m": btc.get("trend_15m"),
+            "trend_1h": btc.get("trend_1h"),
+            "trend_4h": btc.get("htf_4h_trend"),
         },
         "long": {
             "ready": long_ready,
             "entry_zone": long_entry_zone,
-            "entry_trigger": bull_trigger,
+            "entry_trigger": btc.get("bull_trigger_price"),
             "sl": long_sl,
             "tp1": long_tp1,
             "tp2": long_tp2,
@@ -194,14 +411,14 @@ def build_next15_report(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         "short": {
             "ready": short_ready,
             "entry_zone": short_entry_zone,
-            "entry_trigger": bear_trigger,
+            "entry_trigger": btc.get("bear_trigger_price"),
             "sl": short_sl,
             "tp1": short_tp1,
             "tp2": short_tp2,
         },
         "key_levels": {
-            "bull_trigger": bull_trigger,
-            "bear_trigger": bear_trigger,
+            "bull_trigger": btc.get("bull_trigger_price"),
+            "bear_trigger": btc.get("bear_trigger_price"),
             "invalidation_long": btc.get("invalidation_long"),
             "invalidation_short": btc.get("invalidation_short"),
             "vwap_1h": btc.get("vwap_1h"),
@@ -211,14 +428,14 @@ def build_next15_report(snapshot: Dict[str, Any]) -> Dict[str, Any]:
             "liq_above_1": btc.get("liq_above_1"),
             "liq_below_1": btc.get("liq_below_1"),
         },
-        "reasons": reasons[:5],
+        "reasons": verdict_meta.get("reasons", []),
     }
 
 
 # -----------------------------
 # Rendering helpers
 # -----------------------------
-def endpoint_links(extra: Optional[List[str]] = None) -> str:
+def endpoint_links() -> str:
     links = [
         "/snapshot",
         "/snapshot-pretty",
@@ -228,8 +445,6 @@ def endpoint_links(extra: Optional[List[str]] = None) -> str:
         "/next15-view",
         "/upload",
     ]
-    if extra:
-        links.extend(extra)
     rendered = "\n".join(f'<a href="{html.escape(link)}">{html.escape(link)}</a>' for link in links)
     return rendered
 
@@ -296,19 +511,18 @@ def make_html_page(title: str, subtitle: str, body: str) -> str:
 </html>"""
 
 
-def zone_text(zone: Any) -> str:
-    if isinstance(zone, list) and len(zone) >= 2:
-        return f"{fmt_num(zone[0])} - {fmt_num(zone[1])}"
-    return "-"
-
-
 def next15_plain_text(report: Dict[str, Any]) -> str:
     return (
         f"Idő: {report.get('source_ts_bucharest', '-')}\n"
         f"Ár: {fmt_num(report.get('price'))}\n"
         f"Következő 15 perc: {report.get('next_15m_bias', 'neutral')}\n"
-        f"Bizalom: {report.get('next_15m_confidence', '-')}\n"
-        f"Verdict: {report.get('next_15m_verdict', '-')}\n\n"
+        f"Bizalom: {fmt_num(report.get('next_15m_confidence'))}\n"
+        f"Verdict: {report.get('next_15m_verdict', '-')}\n"
+        f"Főirány (1h/15m): {report.get('dominant_bias_1h_15m', '-')}\n"
+        f"Execution bias (5m): {report.get('execution_bias_5m', '-')}\n"
+        f"Bias stabilitás: {fmt_num(report.get('bias_stability'))}\n"
+        f"Bias flip risk: {fmt_num(report.get('bias_flip_risk'))}\n"
+        f"Flip cooldown aktív: {report.get('flip_cooldown_active', False)}\n\n"
         f"Long:\n"
         f"  Ready: {report.get('long', {}).get('ready', False)}\n"
         f"  Entry zone: {zone_text(report.get('long', {}).get('entry_zone'))}\n"
@@ -368,7 +582,7 @@ def health() -> Response:
         try:
             snap = load_snapshot()
             payload["snapshot_ts_bucharest"] = snap.get("ts_bucharest")
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             payload["snapshot_read_error"] = str(exc)
     return jsonify(payload)
 
@@ -471,7 +685,7 @@ def get_next15_view() -> Response:
         return Response(
             make_html_page(
                 "BTC Pro Next 15m",
-                "Rövid, tömör 15 perces bias jelentés long és short setup szintekkel.",
+                "Rövid 15 perces bias jelentés, erősebb 1h/15m szűrővel és lassabb irányváltással.",
                 body,
             ),
             mimetype="text/html; charset=utf-8",
