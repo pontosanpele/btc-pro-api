@@ -58,13 +58,22 @@ def _extract_trade_view(data):
         'htf_context': b.get('dominant_bias_context','-'),
         'ltf_bias': b.get('execution_bias_ltf','-'),
         'ltf_context': b.get('execution_bias_context','-'),
+        'analysis_bias': b.get('analysis_bias','-'),
+        'execution_status': b.get('execution_status','-'),
+        'trade_plan_status': b.get('trade_plan_status','-'),
         'verdict': b.get('canonical_final_action') or b.get('final_action_v4') or b.get('final_action_v3') or b.get('final_action_v2') or b.get('final_action') or tr.get('verdict','WAIT'),
         'confidence': _r(b.get('trade_plan_confidence') or b.get('confidence_score')),
         'long_entry_zone': long_zone,
+        'long_entry_zone_aggressive': _zone(tr.get('long_entry_zone_aggressive')) or _zone(b.get('long_entry_zone_aggressive')),
+        'long_entry_zone_conservative': _zone(tr.get('long_entry_zone_conservative')) or _zone(b.get('long_entry_zone_conservative')),
+        'long_countertrend': bool(tr.get('long_countertrend') or b.get('long_is_countertrend')),
         'long_sl': _r(tr.get('long_sl') or b.get('atr_stop_long')),
         'long_tp1': _r(tr.get('long_tp1') or b.get('target_long_1')),
         'long_tp2': _r(tr.get('long_tp2') or b.get('target_long_2')),
         'short_entry_zone': short_zone,
+        'short_entry_zone_aggressive': _zone(tr.get('short_entry_zone_aggressive')) or _zone(b.get('short_entry_zone_aggressive')),
+        'short_entry_zone_conservative': _zone(tr.get('short_entry_zone_conservative')) or _zone(b.get('short_entry_zone_conservative')),
+        'short_countertrend': bool(tr.get('short_countertrend') or b.get('short_is_countertrend')),
         'short_sl': _r(tr.get('short_sl') or b.get('atr_stop_short')),
         'short_tp1': _r(tr.get('short_tp1') or b.get('target_short_1')),
         'short_tp2': _r(tr.get('short_tp2') or b.get('target_short_2')),
@@ -97,21 +106,29 @@ def _json(obj, status=200):
 
 def _layout(title, body):
     nav="<nav><a href='/'>Főoldal</a><a href='/snapshot-view'>Snapshot</a><a href='/trade-view'>Trade</a><a href='/next15-view'>Köv. 15p</a></nav>"
-    css="body{font-family:Inter,Arial,sans-serif;margin:0;background:#0f172a;color:#e5e7eb}nav{display:flex;gap:14px;padding:14px 18px;background:#111827;border-bottom:1px solid #1f2937}nav a{color:#93c5fd;text-decoration:none}.wrap{max-width:1100px;margin:24px auto;padding:0 16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.card{background:#111827;border:1px solid #1f2937;border-radius:16px;padding:16px}.title{font-weight:700;margin-bottom:10px}.muted{color:#94a3b8}.mono{font-family:ui-monospace,Menlo,monospace}table{width:100%;border-collapse:collapse}td{padding:6px 0;border-bottom:1px solid #1f2937;vertical-align:top}.good{color:#86efac}.bad{color:#fca5a5}.pre{white-space:pre-wrap;word-break:break-word}"
+    css="body{font-family:Inter,Arial,sans-serif;margin:0;background:#0b1220;color:#e5e7eb}nav{display:flex;gap:14px;align-items:center;padding:14px 18px;background:#111827;border-bottom:1px solid #1f2937;position:sticky;top:0}nav a{color:#cbd5e1;text-decoration:none;padding:8px 10px;border-radius:10px;background:#0f172a}nav a:hover{background:#172033}.wrap{max-width:1180px;margin:24px auto;padding:0 16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.card{background:#111827;border:1px solid #1f2937;border-radius:18px;padding:16px}.title{font-weight:700;margin-bottom:10px}.muted{color:#94a3b8}.mono{font-family:ui-monospace,Menlo,monospace}table{width:100%;border-collapse:collapse}td{padding:8px 0;border-bottom:1px solid #1f2937;vertical-align:top}.good{color:#86efac}.bad{color:#fca5a5}.pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700}.pill-long{background:#052e16;color:#86efac;border:1px solid #166534}.pill-short{background:#3f0a0a;color:#fca5a5;border:1px solid #7f1d1d}.pill-neutral{background:#1f2937;color:#cbd5e1;border:1px solid #334155}.section-long{border-left:4px solid #16a34a}.section-short{border-left:4px solid #dc2626}.pre{white-space:pre-wrap;word-break:break-word}"
     return f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{html.escape(title)}</title><style>{css}</style></head><body>{nav}<div class='wrap'><h1>{html.escape(title)}</h1>{body}</div></body></html>"
 
 def _zone_txt(z):
     z=_zone(z)
     return '-' if not z else f"{z[0]} – {z[1]}"
 
+def _pill(value):
+    v=str(value or '-').lower()
+    cls='pill-neutral'
+    if 'long' in v: cls='pill-long'
+    elif 'short' in v: cls='pill-short'
+    return f"<span class='pill {cls}'>{html.escape(str(value or '-'))}</span>"
+
+
 def _trade_body(p):
     reasons=''.join(f"<li>{html.escape(str(x))}</li>" for x in (p.get('reasons') or ['-']))
-    return f"<div class='grid'><div class='card'><div class='title'>Bias</div><table><tr><td>HTF bias</td><td>{html.escape(str(p.get('htf_bias')))}</td></tr><tr><td>HTF context</td><td>{html.escape(str(p.get('htf_context')))}</td></tr><tr><td>LTF bias</td><td>{html.escape(str(p.get('ltf_bias')))}</td></tr><tr><td>LTF context</td><td>{html.escape(str(p.get('ltf_context')))}</td></tr><tr><td>Verdict</td><td>{html.escape(str(p.get('verdict')))}</td></tr><tr><td>Bizalom</td><td>{p.get('confidence')}</td></tr><tr><td>Ár</td><td>{p.get('price')}</td></tr></table></div><div class='card'><div class='title'>Long</div><table><tr><td>Belépő zóna</td><td>{_zone_txt(p.get('long_entry_zone'))}</td></tr><tr><td>SL</td><td>{p.get('long_sl')}</td></tr><tr><td>TP1</td><td>{p.get('long_tp1')}</td></tr><tr><td>TP2</td><td>{p.get('long_tp2')}</td></tr></table></div><div class='card'><div class='title'>Short</div><table><tr><td>Belépő zóna</td><td>{_zone_txt(p.get('short_entry_zone'))}</td></tr><tr><td>SL</td><td>{p.get('short_sl')}</td></tr><tr><td>TP1</td><td>{p.get('short_tp1')}</td></tr><tr><td>TP2</td><td>{p.get('short_tp2')}</td></tr></table></div><div class='card'><div class='title'>Kulcsszintek</div><table><tr><td>Bull trigger</td><td>{p.get('bull_trigger')}</td></tr><tr><td>Bear trigger</td><td>{p.get('bear_trigger')}</td></tr><tr><td>Idő</td><td>{html.escape(str(p.get('ts_bucharest')))}</td></tr></table></div><div class='card'><div class='title'>Indokok</div><ul>{reasons}</ul></div></div>"
-
-def _next15_body(p):
-    return _trade_body(p) + f"<div class='card'><div class='title'>Következő 15 perc</div><table><tr><td>Bias</td><td>{html.escape(str(p.get('next_15m_bias')))}</td></tr><tr><td>Retest winner</td><td>{html.escape(str(p.get('retest_winner_side')))}</td></tr><tr><td>Regime</td><td>{html.escape(str(p.get('market_regime')))}</td></tr><tr><td>Conf direction</td><td>{p.get('confidence_direction')}</td></tr><tr><td>Conf execution</td><td>{p.get('confidence_execution')}</td></tr><tr><td>Conf RR</td><td>{p.get('confidence_rr')}</td></tr><tr><td>Conf external</td><td>{p.get('confidence_external')}</td></tr></table></div>"
+    long_extra = f"<tr><td>Aggresszív</td><td>{_zone_txt(p.get('long_entry_zone_aggressive'))}</td></tr><tr><td>Konzervatív</td><td>{_zone_txt(p.get('long_entry_zone_conservative'))}</td></tr>"
+    short_extra = f"<tr><td>Aggresszív</td><td>{_zone_txt(p.get('short_entry_zone_aggressive'))}</td></tr><tr><td>Konzervatív</td><td>{_zone_txt(p.get('short_entry_zone_conservative'))}</td></tr>"
+    return f"<div class='grid'><div class='card'><div class='title'>Bias összkép</div><table><tr><td>HTF bias</td><td>{_pill(p.get('htf_bias'))}</td></tr><tr><td>HTF context</td><td>{html.escape(str(p.get('htf_context')))}</td></tr><tr><td>LTF bias</td><td>{_pill(p.get('ltf_bias'))}</td></tr><tr><td>LTF context</td><td>{html.escape(str(p.get('ltf_context')))}</td></tr><tr><td>Analysis bias</td><td>{_pill(p.get('analysis_bias'))}</td></tr><tr><td>Execution status</td><td>{html.escape(str(p.get('execution_status')))}</td></tr><tr><td>Trade plan</td><td>{html.escape(str(p.get('trade_plan_status')))}</td></tr><tr><td>Verdict</td><td>{_pill(p.get('verdict'))}</td></tr><tr><td>Bizalom</td><td>{p.get('confidence')}</td></tr><tr><td>Ár</td><td>{p.get('price')}</td></tr></table></div><div class='card section-long'><div class='title good'>Long lehetőség</div><table><tr><td>Belépő zóna</td><td>{_zone_txt(p.get('long_entry_zone'))}</td></tr>{long_extra}<tr><td>Countertrend</td><td>{'igen' if p.get('long_countertrend') else 'nem'}</td></tr><tr><td>SL</td><td>{p.get('long_sl')}</td></tr><tr><td>TP1</td><td>{p.get('long_tp1')}</td></tr><tr><td>TP2</td><td>{p.get('long_tp2')}</td></tr></table></div><div class='card section-short'><div class='title bad'>Short lehetőség</div><table><tr><td>Belépő zóna</td><td>{_zone_txt(p.get('short_entry_zone'))}</td></tr>{short_extra}<tr><td>Countertrend</td><td>{'igen' if p.get('short_countertrend') else 'nem'}</td></tr><tr><td>SL</td><td>{p.get('short_sl')}</td></tr><tr><td>TP1</td><td>{p.get('short_tp1')}</td></tr><tr><td>TP2</td><td>{p.get('short_tp2')}</td></tr></table></div><div class='card'><div class='title'>Kulcsszintek</div><table><tr><td>Bull trigger</td><td>{p.get('bull_trigger')}</td></tr><tr><td>Bear trigger</td><td>{p.get('bear_trigger')}</td></tr><tr><td>Idő</td><td>{html.escape(str(p.get('ts_bucharest')))}</td></tr></table></div><div class='card'><div class='title'>Indokok</div><ul>{reasons}</ul></div></div>"
 
 @app.route('/')
+
 def home():
     body="<div class='grid'><div class='card'><div class='title'>Snapshot</div><p class='muted'>/snapshot-view</p></div><div class='card'><div class='title'>Trade</div><p class='muted'>/trade-view</p></div><div class='card'><div class='title'>Köv. 15 perc</div><p class='muted'>/next15-view</p></div></div>"
     return _resp_text(_layout('BTC Snapshot Dashboard', body), ctype='text/html; charset=utf-8')
