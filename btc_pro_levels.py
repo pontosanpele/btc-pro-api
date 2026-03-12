@@ -40,8 +40,8 @@ def _safe_ratio(a, b):
 
 def orderbook_wall_tracker(d):
     mid = d.get('orderbook_mid')
-    bid_wall = d.get('liq_below_1')
-    ask_wall = d.get('liq_above_1')
+    bid_wall = d.get('largest_bid_wall_price') or d.get('liq_below_1')
+    ask_wall = d.get('largest_ask_wall_price') or d.get('liq_above_1')
     ob = d.get('orderbook_imbalance_0_25_pct')
     bid_usd = d.get('largest_bid_wall_usd')
     ask_usd = d.get('largest_ask_wall_usd')
