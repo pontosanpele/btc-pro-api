@@ -15,6 +15,13 @@ URL_INSTRUMENTS = f"{BASE}/v5/market/instruments-info"
 URL_GLOBAL = "https://api.coingecko.com/api/v3/global"
 WS_PUBLIC = "wss://stream.bybit.com/v5/public/linear"
 
+DERIBIT_BASE = "https://www.deribit.com/api/v2"
+DERIBIT_URL_BOOK_SUMMARY_BY_CURRENCY = f"{DERIBIT_BASE}/public/get_book_summary_by_currency"
+DERIBIT_URL_BOOK_SUMMARY_BY_INSTRUMENT = f"{DERIBIT_BASE}/public/get_book_summary_by_instrument"
+DERIBIT_BTC_PERP = "BTC-PERPETUAL"
+CME_BTC_VOLUME_OI_URL = "https://www.cmegroup.com/markets/cryptocurrencies/bitcoin/bitcoin.volume.html"
+CME_BTC_BENCHMARK_URL = "https://www.cmegroup.com/markets/cryptocurrencies/cme-cf-cryptocurrency-benchmarks.html"
+
 BINANCE_URL_TICKER_24H = f"{BINANCE_BASE}/api/v3/ticker/24hr"
 BINANCE_URL_BOOK_TICKER = f"{BINANCE_BASE}/api/v3/ticker/bookTicker"
 BINANCE_URL_KLINES = f"{BINANCE_BASE}/api/v3/klines"
@@ -119,4 +126,20 @@ ORDERFLOW_CONFIDENCE_V2 = {
     "orderflow_consistency_weight": 0.34,
     "delta_strength_weight": 0.18,
     "flow_alignment_weight": 0.18,
+}
+
+
+EXTERNAL_CONFIRMATION_WEIGHTS = {
+    "deribit_basis_bps": 0.20,
+    "deribit_put_call_oi": 0.30,
+    "deribit_futures_oi": 0.25,
+    "cme_context": 0.25,
+}
+
+HTF_GATE_CONFIG = {
+    "dominant_trend_weight_1h": 18,
+    "dominant_trend_weight_4h": 12,
+    "trend_weight_15m": 10,
+    "flip_cooldown_min_persistence": 2,
+    "countertrend_acceptance_penalty": 12,
 }

@@ -736,3 +736,17 @@ def harmonize_final_outputs(d):
 
 def final_decision_v4(d):
     return harmonize_final_outputs(d)
+
+
+def canonical_final_decision(d):
+    action = d.get('final_action_v3') or d.get('final_tier') or d.get('final_action_v2') or d.get('final_action') or 'WAIT'
+    side = d.get('final_side_v3') or d.get('final_tier_side') or d.get('final_side_v2') or d.get('final_side') or 'none'
+    rr = d.get('rr_long_to_t1') if side=='long' else d.get('rr_short_to_t1') if side=='short' else None
+    if side=='long' and isinstance(rr,(int,float)):
+        if rr < 1.0: action='LATE_LONG'
+        elif rr < 1.3 and action in ('LONG_TRIGGER_READY','LONG_RETEST_READY'): action='LONG_CONFIRM_WAIT'
+    if side=='short' and isinstance(rr,(int,float)):
+        if rr < 1.0: action='LATE_SHORT'
+        elif rr < 1.3 and action in ('SHORT_TRIGGER_READY','SHORT_RETEST_READY'): action='SHORT_CONFIRM_WAIT'
+    reason = d.get('final_reason_v3') or d.get('final_tier_reasons') or d.get('final_reason_v2') or d.get('final_reason') or [action.lower()]
+    return {'canonical_final_action':action,'canonical_final_side':side,'canonical_final_reason':reason[:4]}

@@ -2,6 +2,34 @@ from btc_pro_config import clamp, NOISE_FLOOR, SESSION_PENALTY_PROFILE, SOFT_SCO
 from btc_pro_metrics import capped_log_score, bucket_score, regime_adaptive_weights
 from btc_pro_history import level_zone_memory
 
+
+def countertrend_penalty(d):
+    dominant = d.get("dominant_bias_htf", "neutral")
+    penalty_long = 0.0
+    penalty_short = 0.0
+    reasons = []
+
+    if dominant == "long":
+        penalty_short += 15.0
+        reasons.append("htf_long_blocks_short")
+        if (d.get("trend_15m") or "") != "down":
+            penalty_short += 6.0
+        if not d.get("bear_break_valid_v2"):
+            penalty_short += 6.0
+    elif dominant == "short":
+        penalty_long += 15.0
+        reasons.append("htf_short_blocks_long")
+        if (d.get("trend_15m") or "") != "up":
+            penalty_long += 6.0
+        if not d.get("bull_break_valid_v2"):
+            penalty_long += 6.0
+
+    return {
+        "countertrend_penalty_long": round(clamp(penalty_long, 0, 40), 2),
+        "countertrend_penalty_short": round(clamp(penalty_short, 0, 40), 2),
+        "countertrend_penalty_reasons": reasons[:3],
+    }
+
 def breakout_quality(d):
     score=0.0; vol5=d.get('volume_spike_5m_x') or 0.0; vol15=d.get('volume_spike_15m_x') or 0.0; re5=d.get('range_expansion_5m_x') or 0.0; delta=abs(d.get('recent_notional_delta_pct') or 0.0); body=d.get('cur5m_body_pct_of_range') or 0.0
     if vol5>0.8: score += min((vol5-0.8)*18,20)
@@ -102,6 +130,7 @@ def no_trade_filter(d):
     vol15 = d.get("volume_spike_15m_x") or 0.0
     confidence = d.get("confidence_score") or 0.0
     regime = d.get("market_regime")
+    dominant = d.get("dominant_bias_htf", "neutral")
 
     if vol5 < 0.5:
         score += 20
@@ -122,6 +151,12 @@ def no_trade_filter(d):
         score += 15
         reasons.append("trap_risk")
 
+    ctp_long = d.get("countertrend_penalty_long") or 0.0
+    ctp_short = d.get("countertrend_penalty_short") or 0.0
+    if max(ctp_long, ctp_short) >= 15:
+        score += 8
+        reasons.append("countertrend_context")
+
     override = 0.0
     override_reasons = []
     direction_score = d.get("direction_consensus_score") or 0.0
@@ -130,7 +165,7 @@ def no_trade_filter(d):
     expected_value = d.get("expected_value_score") or 0.0
     trigger_behavior = max(d.get("trigger_behavior_long_score") or 0.0, d.get("trigger_behavior_short_score") or 0.0)
 
-    context_friendly = regime in ("trend_build_long", "trend_build_short", "short_squeeze", "long_flush")
+    context_friendly = regime in ("trend_build_long", "trend_build_short", "short_squeeze", "long_flush", "impulse_up", "impulse_down")
     if direction_score >= 80:
         override += 8
         override_reasons.append("strong_direction_consensus")
@@ -150,7 +185,25 @@ def no_trade_filter(d):
         override += 6
         override_reasons.append("regime_context_override")
 
-    override = min(override, 26.0 if regime != "low_liquidity_range" else 14.0)
+    if regime == "low_liquidity_range":
+        strong_override = (
+            direction_score >= 85
+            and retest >= 75
+            and (d.get("volume_spike_15m_x") or 0.0) >= 1.0
+            and (d.get("breakout_quality_v2") or 0.0) >= 55
+        )
+        if not strong_override:
+            override = min(override, 10.0)
+        else:
+            override = min(override + 4.0, 18.0)
+            override_reasons.append("range_override_confirmed")
+    else:
+        override = min(override, 26.0)
+
+    if dominant == "neutral" and regime == "low_liquidity_range":
+        score += 6
+        reasons.append("neutral_htf_in_range")
+
     adjusted_score = clamp(score - override, 0, 100)
     active = adjusted_score >= 45
 
@@ -986,6 +1039,10 @@ def acceptance_engine(d, history_rows):
         long_acceptance += min(long_volume_support / max(long_holds, 1), 18.0) if long_holds else 0.0
         if long_retest_success:
             long_acceptance += 12.0
+        if d.get("dominant_bias_htf") == "long":
+            long_acceptance += 8.0
+        elif d.get("dominant_bias_htf") == "short":
+            long_acceptance -= 8.0
 
     if bear not in (None, 0) and last is not None:
         dist = (bear - last) / bear * 100.0
@@ -996,6 +1053,10 @@ def acceptance_engine(d, history_rows):
         short_acceptance += min(short_volume_support / max(short_holds, 1), 18.0) if short_holds else 0.0
         if short_retest_success:
             short_acceptance += 12.0
+        if d.get("dominant_bias_htf") == "short":
+            short_acceptance += 8.0
+        elif d.get("dominant_bias_htf") == "long":
+            short_acceptance -= 8.0
 
     return {
         "acceptance_hold_bars_5m_long": long_holds,
@@ -1009,12 +1070,13 @@ def acceptance_engine(d, history_rows):
         "acceptance_quality_score": round(max(long_acceptance, short_acceptance), 2),
     }
 
-
 def breakout_validation_v2(d):
     bull = 0.0
     bear = 0.0
+    dominant = d.get("dominant_bias_htf", "neutral")
+    ctp_long = d.get("countertrend_penalty_long") or 0.0
+    ctp_short = d.get("countertrend_penalty_short") or 0.0
 
-    # long breakout quality
     if (d.get("last") or 0) >= (d.get("bull_trigger_price") or 10**18):
         bull += 18
     bull += min((d.get("breakout_quality_score") or 0) * 0.45, 20.0)
@@ -1022,12 +1084,15 @@ def breakout_validation_v2(d):
     bull += min((d.get("long_acceptance_score") or 0) * 0.35, 20.0)
     bull += min((d.get("volume_quality_score") or 0) * 0.12, 10.0)
     bull += min((d.get("breakout_confirmation_cluster") or 0) * 0.18, 12.0)
+    if dominant == "long":
+        bull += 8
+    elif dominant == "short":
+        bull -= ctp_long * 0.5
     if (d.get("cur5m_upper_wick_pct_of_range") or 0) > 55:
         bull -= 10
     if (d.get("signal_conflict_score") or 0) >= 45:
         bull -= 8
 
-    # short breakout quality
     if (d.get("last") or 10**18) <= (d.get("bear_trigger_price") or -10**18):
         bear += 18
     bear += min((d.get("breakout_quality_score") or 0) * 0.45, 20.0)
@@ -1035,6 +1100,10 @@ def breakout_validation_v2(d):
     bear += min((d.get("short_acceptance_score") or 0) * 0.35, 20.0)
     bear += min((d.get("volume_quality_score") or 0) * 0.12, 10.0)
     bear += min((d.get("breakout_confirmation_cluster") or 0) * 0.18, 12.0)
+    if dominant == "short":
+        bear += 8
+    elif dominant == "long":
+        bear -= ctp_short * 0.5
     if (d.get("cur5m_lower_wick_pct_of_range") or 0) > 55:
         bear -= 10
     if (d.get("signal_conflict_score") or 0) >= 45:
@@ -1043,9 +1112,12 @@ def breakout_validation_v2(d):
     bull = max(0.0, min(100.0, bull))
     bear = max(0.0, min(100.0, bear))
 
+    bull_threshold = 58 if dominant != "short" else 64
+    bear_threshold = 58 if dominant != "long" else 64
+
     return {
-        "bull_break_valid_v2": bull >= 58,
-        "bear_break_valid_v2": bear >= 58,
+        "bull_break_valid_v2": bull >= bull_threshold,
+        "bear_break_valid_v2": bear >= bear_threshold,
         "breakout_acceptance_window_score": round(max(bull, bear), 2),
         "breakout_fail_risk": round(
             max(
@@ -1062,3 +1134,4 @@ def breakout_validation_v2(d):
             2,
         ),
     }
+

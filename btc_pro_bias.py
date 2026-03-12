@@ -204,9 +204,11 @@ def market_and_trading_bias(d):
     elif (d.get("expected_value_score") or 0) < 35:
         trade_bias = "no_trade"
 
+    ext = external_confirmation(d)
     return {
         "market_bias": market_bias,
         "trading_bias": trade_bias,
+        **ext,
     }
 
 def hard_gate_evaluation(d):
@@ -251,3 +253,60 @@ def soft_score_stack(d):
         "soft_score_components": components,
     }
 
+
+
+
+def dominant_htf_bias(d):
+    long_score = short_score = 0.0
+    if d.get('trend_1h') == 'up': long_score += 18
+    if d.get('trend_1h') == 'down': short_score += 18
+    if d.get('trend_15m') == 'up': long_score += 8
+    if d.get('trend_15m') == 'down': short_score += 8
+    pv = d.get('price_vs_vwap_1h_pct') or 0.0
+    if pv > 0: long_score += min(abs(pv) * 10, 8)
+    if pv < 0: short_score += min(abs(pv) * 10, 8)
+    if d.get('market_regime') in ('trend_build_short','impulse_down','flush_down','selloff_followthrough','trend_short_followthrough'): short_score += 8
+    if d.get('market_regime') in ('trend_build_long','impulse_up','short_squeeze_attempt','trend_up_followthrough'): long_score += 8
+    side='neutral'; strength=0.0; context='neutral'
+    if short_score >= long_score + 8:
+        side='short'; strength=short_score-long_score; context='trend_down_followthrough' if d.get('trend_5m')=='down' else 'trend_down_pullback'
+    elif long_score >= short_score + 8:
+        side='long'; strength=long_score-short_score; context='trend_up_followthrough' if d.get('trend_5m')=='up' else 'trend_up_pullback'
+    return {'dominant_bias_htf': side, 'dominant_bias_strength': round(clamp(strength,0,100),2), 'dominant_bias_context': context}
+
+
+def execution_bias_ltf(d):
+    long_score = short_score = 0.0
+    if d.get('trend_5m') == 'up': long_score += 14
+    if d.get('trend_5m') == 'down': short_score += 14
+    if d.get('retest_winner_side') == 'long': long_score += min((d.get('retest_long_score') or 0.0) * 0.45, 42)
+    if d.get('retest_winner_side') == 'short': short_score += min((d.get('retest_short_score') or 0.0) * 0.45, 42)
+    if d.get('wall_pressure_side') == 'bid': long_score += 10
+    if d.get('wall_pressure_side') == 'ask': short_score += 10
+    if (d.get('recent_notional_delta_pct') or 0) > 0: long_score += 8
+    if (d.get('recent_notional_delta_pct') or 0) < 0: short_score += 8
+    side='neutral'; ctx='neutral'
+    if short_score >= long_score + 8:
+        side='short'; ctx='pullback_short_in_long' if d.get('dominant_bias_htf')=='long' else 'trend_short'
+    elif long_score >= short_score + 8:
+        side='long'; ctx='pullback_long_in_short' if d.get('dominant_bias_htf')=='short' else 'trend_long'
+    return {'execution_bias_ltf': side, 'execution_bias_context': ctx, 'execution_long_score': round(long_score,2), 'execution_short_score': round(short_score,2)}
+
+
+def external_confirmation(d):
+    deriv = d.get('deribit_market_bias')
+    cme = d.get('cme_market_bias')
+    local = d.get('trade_bias') or d.get('direction_consensus_side') or 'neutral'
+    labels=[]
+    for src in (deriv, cme):
+        if src in ('long','short','neutral'): labels.append(src)
+    if not labels:
+        return {'external_confirmation_alignment':'missing','external_confirmation_score':35.0,'confidence_external':35.0}
+    same = sum(1 for x in labels if x == local)
+    opp = sum(1 for x in labels if x not in ('neutral', local))
+    neu = sum(1 for x in labels if x == 'neutral')
+    if same >= 2: align,score='strong_align',80.0
+    elif same == 1 and opp == 0: align,score='weak_align',65.0
+    elif opp >= 1 and same == 0: align,score='contrarian',25.0
+    else: align,score='mixed',50.0 if neu else 45.0
+    return {'external_confirmation_alignment':align,'external_confirmation_score':score,'confidence_external':score}

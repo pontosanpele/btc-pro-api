@@ -1,524 +1,428 @@
-# btc_pro_market.py
-import statistics
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-import requests
-
-SYMBOL = "BTCUSDT"
-
-URL_BYBIT_BASE = "https://api.bybit.com"
-URL_INSTRUMENTS = f"{URL_BYBIT_BASE}/v5/market/instruments-info"
-URL_TICKERS = f"{URL_BYBIT_BASE}/v5/market/tickers"
-URL_ORDERBOOK = f"{URL_BYBIT_BASE}/v5/market/orderbook"
-URL_KLINE = f"{URL_BYBIT_BASE}/v5/market/kline"
-URL_RECENT_TRADES = f"{URL_BYBIT_BASE}/v5/market/recent-trade"
-URL_OPEN_INTEREST = f"{URL_BYBIT_BASE}/v5/market/open-interest"
-URL_FUNDING_HISTORY = f"{URL_BYBIT_BASE}/v5/market/funding/history"
-
-URL_BINANCE_BASE = "https://api.binance.com"
-URL_BINANCE_TICKER_24H = f"{URL_BINANCE_BASE}/api/v3/ticker/24hr"
-URL_BINANCE_TICKER_PRICE = f"{URL_BINANCE_BASE}/api/v3/ticker/price"
-URL_BINANCE_KLINES = f"{URL_BINANCE_BASE}/api/v3/klines"
-
-URL_GLOBAL = "https://api.coingecko.com/api/v3/global"
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-})
+import json, re, ssl, threading, time
+from statistics import median
+from btc_pro_config import (
+    BINANCE_URL_BOOK_TICKER,
+    BINANCE_URL_KLINES,
+    BINANCE_URL_TICKER_24H,
+    CME_BTC_BENCHMARK_URL,
+    CME_BTC_VOLUME_OI_URL,
+    DERIBIT_BTC_PERP,
+    DERIBIT_URL_BOOK_SUMMARY_BY_CURRENCY,
+    DERIBIT_URL_BOOK_SUMMARY_BY_INSTRUMENT,
+    SESSION,
+    SYMBOL_PERP,
+    SYMBOL_SPOT,
+    URL_FUNDING,
+    URL_GLOBAL,
+    URL_INSTRUMENTS,
+    URL_KLINE,
+    URL_OI,
+    URL_ORDERBOOK,
+    URL_TICKERS,
+    URL_TRADES,
+    WS_PUBLIC,
+    f,
+    fmt_side,
+    pct,
+    safe_div,
+)
+from btc_pro_sources import attach_source, resolve_route
 
 
-def _f(x, default=0.0):
-    try:
-        if x is None or x == "":
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
-def _i(x, default=0):
-    try:
-        if x is None or x == "":
-            return default
-        return int(float(x))
-    except Exception:
-        return default
-
-
-def _pct_change(new, old, default=0.0):
-    new = _f(new, None)
-    old = _f(old, None)
-    if new is None or old in (None, 0):
-        return default
-    return ((new / old) - 1.0) * 100.0
-
-
-def _safe_div(a, b, default=0.0):
-    a = _f(a, None)
-    b = _f(b, None)
-    if a is None or b in (None, 0):
-        return default
-    return a / b
-
-
-def _median(vals, default=0.0):
-    vals = [float(v) for v in vals if v is not None]
-    if not vals:
-        return default
-    return statistics.median(vals)
-
-
-def _clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
-def req(url, params=None, timeout=12):
+def req(url, params=None, timeout=15):
     r = SESSION.get(url, params=params, timeout=timeout)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    if isinstance(data, dict) and data.get('retCode') not in (0, '0', None):
+        raise RuntimeError(f'API hiba: {data}')
+    return data
 
 
-def req_bybit(url, params=None, timeout=12):
+def req_bybit(url, params=None, timeout=15):
     return req(url, params=params, timeout=timeout)
 
 
-def req_binance(url, params=None, timeout=12):
+def req_binance(url, params=None, timeout=15):
     return req(url, params=params, timeout=timeout)
 
-
-def _now_bucharest():
-    return datetime.now(ZoneInfo("Europe/Bucharest")).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def instrument_info(symbol=SYMBOL):
-    items = req_bybit(URL_INSTRUMENTS, {"category": "linear", "symbol": symbol})["result"]["list"]
-    item = items[0] if items else {}
-    return {
-        "funding_interval_min": _i(item.get("fundingInterval"), 480),
-        "launch_time_ms": str(item.get("launchTime", "")),
-        "price_scale": str(item.get("priceScale", "")),
-        "source_instrument_info": "bybit",
-    }
+def req_deribit(url, params=None, timeout=15):
+    r = SESSION.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and data.get('error'):
+        raise RuntimeError(f"Deribit API hiba: {data['error']}")
+    return data.get('result', data)
 
 
-def ticker(symbol=SYMBOL):
-    items = req_bybit(URL_TICKERS, {"category": "linear", "symbol": symbol})["result"]["list"]
-    item = items[0] if items else {}
-
-    last = _f(item.get("lastPrice"))
-    bid1 = _f(item.get("bid1Price"))
-    ask1 = _f(item.get("ask1Price"))
-    low24 = _f(item.get("lowPrice24h"))
-    high24 = _f(item.get("highPrice24h"))
-    prev24 = _f(item.get("prevPrice24h"))
-    mark = _f(item.get("markPrice"))
-    index = _f(item.get("indexPrice"))
-
-    return {
-        "last": last,
-        "bid1": bid1,
-        "ask1": ask1,
-        "low24": low24,
-        "high24": high24,
-        "prev24": prev24,
-        "chg24_pct": _f(item.get("price24hPcnt")) * 100.0,
-        "turnover24_usd": _f(item.get("turnover24h")),
-        "volume24": _f(item.get("volume24h")),
-        "mark": mark,
-        "index": index,
-        "funding_pct": _f(item.get("fundingRate")) * 100.0,
-        "open_interest": _f(item.get("openInterest")),
-        "spread_bps": 0.0 if last == 0 else ((ask1 - bid1) / last) * 10000.0,
-        "premium_vs_index_pct": _pct_change(mark, index, 0.0),
-        "range_pos_pct": 0.0 if high24 == low24 else ((last - low24) / (high24 - low24)) * 100.0,
-        "source_ticker": "bybit",
-    }
+def _as_rows(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        if isinstance(payload.get('result'), list):
+            return payload['result']
+        return [payload]
+    return []
 
 
-def funding_history(symbol=SYMBOL, limit=10):
-    data = req_bybit(
-        URL_FUNDING_HISTORY,
-        {"category": "linear", "symbol": symbol, "limit": limit},
-    )["result"]["list"]
-
-    vals = [_f(x.get("fundingRate")) * 100.0 for x in data]
-    vals = list(reversed(vals))
-
-    slope = 0.0
-    accel = 0.0
-    if len(vals) >= 2:
-        slope = vals[-1] - vals[-2]
-    if len(vals) >= 3:
-        accel = (vals[-1] - vals[-2]) - (vals[-2] - vals[-3])
-
-    cur = vals[-1] if vals else 0.0
-
-    return {
-        "funding_pct": cur,
-        "funding_history_pct": vals,
-        "funding_slope_pct_pt": slope,
-        "funding_accel_pct_pt": accel,
-        "source_funding": "bybit",
-    }
+def _extract_number_near_label(html, labels):
+    if not html:
+        return None
+    candidates = []
+    for label in labels:
+        patterns = [
+            rf"{label}[^0-9]{{0,80}}([0-9][0-9,\.]+)",
+            rf"([0-9][0-9,\.]+)[^<]{{0,80}}{label}",
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, flags=re.I)
+            if m:
+                raw = m.group(1).replace(',', '')
+                try:
+                    candidates.append(float(raw))
+                except Exception:
+                    pass
+    return candidates[0] if candidates else None
 
 
-def all_oi(symbol=SYMBOL):
-    t = ticker(symbol)
-    oi_now = _f(t.get("open_interest"))
-
-    return {
-        "oi_5m": oi_now,
-        "oi_change_5m_pct": 0.0,
-        "oi_15m": oi_now,
-        "oi_change_15m_pct": 0.0,
-        "oi_30m": oi_now,
-        "oi_change_30m_pct": 0.0,
-        "oi_1h": oi_now,
-        "oi_change_1h_pct": 0.0,
-        "oi_4h": oi_now,
-        "oi_change_4h_pct": 0.0,
-        "oi_1d": oi_now,
-        "oi_change_1d_pct": 0.0,
-        "source_open_interest": "bybit",
-    }
-
-
-def orderbook(symbol=SYMBOL, limit=50):
-    data = req_bybit(
-        URL_ORDERBOOK,
-        {"category": "linear", "symbol": symbol, "limit": limit},
-    )["result"]
-
-    bids = [(_f(p), _f(q)) for p, q in (data.get("b", []) or [])]
-    asks = [(_f(p), _f(q)) for p, q in (data.get("a", []) or [])]
-
-    best_bid = bids[0][0] if bids else 0.0
-    best_ask = asks[0][0] if asks else 0.0
-    mid = (best_bid + best_ask) / 2.0 if best_bid and best_ask else 0.0
-
-    def side_notional(rows, pct):
-        if not mid:
-            return 0.0
-        lo = mid * (1.0 - pct)
-        hi = mid * (1.0 + pct)
-        total = 0.0
-        for price, qty in rows:
-            if lo <= price <= hi:
-                total += price * qty
-        return total
-
+def deribit_btc_context():
     out = {
-        "orderbook_mid": mid,
-        "source_orderbook": "bybit",
+        'deribit_perp_last': None,
+        'deribit_perp_bid': None,
+        'deribit_perp_ask': None,
+        'deribit_perp_mark': None,
+        'deribit_perp_index': None,
+        'deribit_basis_bps': None,
+        'deribit_futures_oi_total': None,
+        'deribit_futures_volume_24h': None,
+        'deribit_option_put_oi': None,
+        'deribit_option_call_oi': None,
+        'deribit_put_call_oi_ratio': None,
+        'deribit_market_bias': 'neutral',
+        'deribit_confirmation_score': 50.0,
+        'source_deribit_context': 'unavailable',
     }
+    try:
+        perp_rows = _as_rows(req_deribit(DERIBIT_URL_BOOK_SUMMARY_BY_INSTRUMENT, {'instrument_name': DERIBIT_BTC_PERP}))
+        fut_rows = _as_rows(req_deribit(DERIBIT_URL_BOOK_SUMMARY_BY_CURRENCY, {'currency': 'BTC', 'kind': 'future'}))
+        opt_rows = _as_rows(req_deribit(DERIBIT_URL_BOOK_SUMMARY_BY_CURRENCY, {'currency': 'BTC', 'kind': 'option'}))
+    except Exception:
+        return out
 
-    for pct, name in [
-        (0.001, "0_10"),
-        (0.0025, "0_25"),
-        (0.005, "0_50"),
-        (0.01, "1_00"),
-    ]:
-        bid_notional = side_notional(bids, pct)
-        ask_notional = side_notional(asks, pct)
-        total = bid_notional + ask_notional
-        imbalance = 0.0 if total == 0 else ((bid_notional - ask_notional) / total) * 100.0
-        out[f"orderbook_imbalance_{name}_pct"] = imbalance
+    perp = perp_rows[0] if perp_rows else {}
+    out['deribit_perp_last'] = f(perp.get('last'))
+    out['deribit_perp_bid'] = f(perp.get('bid_price'))
+    out['deribit_perp_ask'] = f(perp.get('ask_price'))
+    out['deribit_perp_mark'] = f(perp.get('mark_price'))
+    out['deribit_perp_index'] = f(perp.get('underlying_index') or perp.get('index_price'))
+    if out['deribit_perp_mark'] is not None and out['deribit_perp_index'] not in (None, 0):
+        out['deribit_basis_bps'] = (out['deribit_perp_mark'] - out['deribit_perp_index']) / out['deribit_perp_index'] * 10000.0
 
-    if bids:
-        lb = max(bids, key=lambda x: x[0] * x[1])
-        out["largest_bid_wall_price"] = lb[0]
-        out["largest_bid_wall_usd"] = lb[0] * lb[1]
-    else:
-        out["largest_bid_wall_price"] = 0.0
-        out["largest_bid_wall_usd"] = 0.0
+    fut_oi = []
+    fut_vol = []
+    for row in fut_rows:
+        oi = f(row.get('open_interest'))
+        vol = f(row.get('volume') or row.get('volume_usd'))
+        if oi is not None:
+            fut_oi.append(oi)
+        if vol is not None:
+            fut_vol.append(vol)
+    out['deribit_futures_oi_total'] = sum(fut_oi) if fut_oi else None
+    out['deribit_futures_volume_24h'] = sum(fut_vol) if fut_vol else None
 
-    if asks:
-        la = max(asks, key=lambda x: x[0] * x[1])
-        out["largest_ask_wall_price"] = la[0]
-        out["largest_ask_wall_usd"] = la[0] * la[1]
-    else:
-        out["largest_ask_wall_price"] = 0.0
-        out["largest_ask_wall_usd"] = 0.0
+    put_oi = call_oi = 0.0
+    saw_option = False
+    for row in opt_rows:
+        oi = f(row.get('open_interest'), 0.0)
+        name = (row.get('instrument_name') or '').upper()
+        option_type = (row.get('option_type') or '').lower()
+        if option_type == 'put' or name.endswith('-P'):
+            put_oi += oi; saw_option = True
+        elif option_type == 'call' or name.endswith('-C'):
+            call_oi += oi; saw_option = True
+    out['deribit_option_put_oi'] = put_oi if saw_option else None
+    out['deribit_option_call_oi'] = call_oi if saw_option else None
+    if saw_option and call_oi > 0:
+        out['deribit_put_call_oi_ratio'] = put_oi / call_oi
 
-    if out["largest_bid_wall_usd"] > out["largest_ask_wall_usd"]:
-        out["wall_pressure_side"] = "bid"
-    elif out["largest_ask_wall_usd"] > out["largest_bid_wall_usd"]:
-        out["wall_pressure_side"] = "ask"
-    else:
-        out["wall_pressure_side"] = "neutral"
-
+    score = 50.0
+    basis = out['deribit_basis_bps']
+    pc = out['deribit_put_call_oi_ratio']
+    oi_total = out['deribit_futures_oi_total']
+    if basis is not None:
+        score += max(-12.0, min(12.0, basis * 0.18))
+    if pc is not None:
+        if pc < 0.9:
+            score += min((0.9 - pc) * 25.0, 10.0)
+        elif pc > 1.1:
+            score -= min((pc - 1.1) * 25.0, 10.0)
+    if oi_total is not None and oi_total > 0:
+        score += min(max((oi_total ** 0.5) / 500.0, 0.0), 8.0)
+    score = round(max(0.0, min(100.0, score)), 2)
+    out['deribit_confirmation_score'] = score
+    out['deribit_market_bias'] = 'long' if score >= 56 else 'short' if score <= 44 else 'neutral'
+    out['source_deribit_context'] = 'deribit'
     return out
 
 
-def recent_trades(symbol=SYMBOL, limit=1000):
-    items = req_bybit(
-        URL_RECENT_TRADES,
-        {"category": "linear", "symbol": symbol, "limit": limit},
-    )["result"]["list"]
-
-    buy_notional = 0.0
-    sell_notional = 0.0
-    buy_qty = 0.0
-    sell_qty = 0.0
-    large_buy = 0.0
-    large_sell = 0.0
-    signed = []
-
-    for row in items:
-        price = _f(row.get("price"))
-        qty = _f(row.get("size"))
-        side = str(row.get("side", "")).lower()
-        notional = price * qty
-
-        if side == "buy":
-            buy_notional += notional
-            buy_qty += qty
-            signed.append(notional)
-            if notional >= 100000:
-                large_buy += notional
-        else:
-            sell_notional += notional
-            sell_qty += qty
-            signed.append(-notional)
-            if notional >= 100000:
-                large_sell += notional
-
-    total_notional = buy_notional + sell_notional
-    total_qty = buy_qty + sell_qty
-
-    taker_buy_ratio = 0.0 if total_qty == 0 else (buy_qty / total_qty) * 100.0
-    delta_pct = 0.0 if total_notional == 0 else ((buy_notional - sell_notional) / total_notional) * 100.0
-    qty_delta_pct = 0.0 if total_qty == 0 else ((buy_qty - sell_qty) / total_qty) * 100.0
-
-    cvd_last = sum(signed)
-    cvd_last_100 = sum(signed[-100:]) if len(signed) >= 100 else cvd_last
-    cvd_last_250 = sum(signed[-250:]) if len(signed) >= 250 else cvd_last
-    cvd_trend = cvd_last_100 - cvd_last_250
-
-    return {
-        "recent_trades_count": len(items),
-        "recent_taker_buy_ratio_pct": taker_buy_ratio,
-        "recent_buy_notional_usd": buy_notional,
-        "recent_sell_notional_usd": sell_notional,
-        "recent_notional_delta_pct": delta_pct,
-        "recent_qty_delta_pct": qty_delta_pct,
-        "large_100k_buy_usd": large_buy,
-        "large_100k_sell_usd": large_sell,
-        "cvd_last_usd": cvd_last,
-        "cvd_last_100_usd": cvd_last_100,
-        "cvd_last_250_usd": cvd_last_250,
-        "cvd_trend_usd": cvd_trend,
-        "source_recent_trades": "bybit",
+def cme_btc_context():
+    out = {
+        'cme_btc_volume': None,
+        'cme_btc_open_interest': None,
+        'cme_reference_context_available': False,
+        'cme_market_bias': 'neutral',
+        'cme_confirmation_score': 50.0,
+        'source_cme_context': 'unavailable',
     }
+    html_parts = []
+    try:
+        html_parts.append(SESSION.get(CME_BTC_VOLUME_OI_URL, timeout=15).text)
+    except Exception:
+        pass
+    try:
+        html_parts.append(SESSION.get(CME_BTC_BENCHMARK_URL, timeout=15).text)
+    except Exception:
+        pass
+    html = '\n'.join(part for part in html_parts if part)
+    if not html:
+        return out
+    vol = _extract_number_near_label(html, ['Volume', 'VOL'])
+    oi = _extract_number_near_label(html, ['Open Interest', 'OI'])
+    out['cme_btc_volume'] = vol
+    out['cme_btc_open_interest'] = oi
+    out['cme_reference_context_available'] = True
+    score = 50.0
+    if oi is not None:
+        score += min(max((oi ** 0.5) / 200.0, 0.0), 8.0)
+    if vol is not None:
+        score += min(max((vol ** 0.5) / 200.0, 0.0), 6.0)
+    html_lower = html.lower()
+    if 'transparency' in html_lower or 'regulated' in html_lower:
+        score += 4.0
+    score = round(max(0.0, min(100.0, score)), 2)
+    out['cme_confirmation_score'] = score
+    out['cme_market_bias'] = 'long' if score >= 56 else 'short' if score <= 44 else 'neutral'
+    out['source_cme_context'] = 'cmegroup'
+    return out
 
 
-def _bybit_klines(symbol=SYMBOL, interval="5", limit=60):
-    data = req_bybit(
-        URL_KLINE,
-        {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit},
-    )["result"]["list"]
-
-    rows = []
-    for row in reversed(data):
-        ts, o, h, l, c, v, t = row[:7]
-        rows.append({
-            "ts": _i(ts),
-            "open": _f(o),
-            "high": _f(h),
-            "low": _f(l),
-            "close": _f(c),
-            "volume": _f(v),
-            "turnover": _f(t),
-        })
-    return rows
+def instrument_info(symbol=SYMBOL_PERP):
+    items = req_bybit(URL_INSTRUMENTS, {'category': 'linear', 'symbol': symbol})['result']['list']
+    if not items:
+        return {}
+    it = items[0]
+    return {'funding_interval_min': it.get('fundingInterval'), 'launch_time_ms': it.get('launchTime'), 'price_scale': it.get('priceScale'), 'source_instrument_info': 'bybit'}
 
 
-def _atr(rows, period=14):
-    if len(rows) < 2:
-        return 0.0
-    trs = []
-    prev_close = rows[0]["close"]
-    for r in rows[1:]:
-        tr = max(
-            r["high"] - r["low"],
-            abs(r["high"] - prev_close),
-            abs(r["low"] - prev_close),
-        )
-        trs.append(tr)
-        prev_close = r["close"]
-    return _median(trs[-period:], 0.0)
+def _bybit_ticker(category, symbol):
+    it = req_bybit(URL_TICKERS, {'category': category, 'symbol': symbol})['result']['list'][0]
+    last = f(it.get('lastPrice')); bid1 = f(it.get('bid1Price')); ask1 = f(it.get('ask1Price')); low24 = f(it.get('lowPrice24h')); high24 = f(it.get('highPrice24h')); prev24 = f(it.get('prevPrice24h')); turnover24 = f(it.get('turnover24h')); volume24 = f(it.get('volume24h'))
+    out = {'last': last, 'bid1': bid1, 'ask1': ask1, 'low24': low24, 'high24': high24, 'prev24': prev24, 'chg24_pct': pct(last, prev24), 'turnover24_usd': turnover24, 'volume24': volume24}
+    if category == 'linear':
+        mark = f(it.get('markPrice')); index = f(it.get('indexPrice')); funding = f(it.get('fundingRate'))
+        spread_bps = ((ask1 - bid1) / ((ask1 + bid1) / 2.0)) * 10000 if None not in (bid1, ask1) and (ask1 + bid1) != 0 else None
+        range_pos = (last - low24) / (high24 - low24) * 100.0 if None not in (last, low24, high24) and high24 != low24 else None
+        out.update({'mark': mark, 'index': index, 'spread_bps': spread_bps, 'premium_vs_index_pct': pct(mark, index), 'funding_pct': None if funding is None else funding * 100.0, 'range_pos_pct': range_pos})
+    return out
 
 
-def _vwap(rows):
-    num = 0.0
-    den = 0.0
+def _binance_spot_ticker(symbol):
+    t24 = req_binance(BINANCE_URL_TICKER_24H, {'symbol': symbol})
+    book = req_binance(BINANCE_URL_BOOK_TICKER, {'symbol': symbol})
+    last = f(t24.get('lastPrice')); bid1 = f(book.get('bidPrice')); ask1 = f(book.get('askPrice')); low24 = f(t24.get('lowPrice')); high24 = f(t24.get('highPrice')); prev24 = f(t24.get('openPrice')); turnover24 = f(t24.get('quoteVolume')); volume24 = f(t24.get('volume'))
+    return {'last': last, 'bid1': bid1, 'ask1': ask1, 'low24': low24, 'high24': high24, 'prev24': prev24, 'chg24_pct': pct(last, prev24), 'turnover24_usd': turnover24, 'volume24': volume24}
+
+
+def ticker(category, symbol):
+    if category == 'linear':
+        return attach_source(_bybit_ticker(category, symbol), 'bybit', 'ticker')
+    routed, source = resolve_route('spot_ticker', {'binance': lambda: _binance_spot_ticker(symbol), 'bybit': lambda: _bybit_ticker('spot', symbol)})
+    return attach_source(routed, source, 'spot_ticker')
+
+
+def funding_history(symbol=SYMBOL_PERP, limit=10):
+    rows = req_bybit(URL_FUNDING, {'category': 'linear', 'symbol': symbol, 'limit': limit})['result']['list']
+    vals = []
     for r in rows:
-        typical = (r["high"] + r["low"] + r["close"]) / 3.0
-        num += typical * r["volume"]
-        den += r["volume"]
-    return 0.0 if den == 0 else num / den
+        rate = f(r.get('fundingRate')); vals.append(None if rate is None else rate * 100.0)
+    latest = vals[0] if vals else None; prev = vals[1] if len(vals) > 1 else None
+    slope = None if None in (latest, prev) else latest - prev
+    accel = (vals[0] - vals[1]) - (vals[1] - vals[2]) if len(vals) > 2 and None not in (vals[0], vals[1], vals[2]) else None
+    return {'funding_history_pct': vals, 'funding_slope_pct_pt': slope, 'funding_accel_pct_pt': accel, 'source_funding': 'bybit'}
 
 
-def _trend_label(closes):
-    if len(closes) < 4:
-        return "range"
-    last = closes[-1]
-    sma3 = sum(closes[-3:]) / 3.0
-    sma6 = sum(closes[-6:]) / 6.0 if len(closes) >= 6 else sum(closes) / len(closes)
-    if last > sma3 > sma6:
-        return "up"
-    if last < sma3 < sma6:
-        return "down"
-    return "range"
+def open_interest(symbol, interval):
+    rows = req_bybit(URL_OI, {'category': 'linear', 'symbol': symbol, 'intervalTime': interval, 'limit': 2})['result']['list']
+    vals = [f(r.get('openInterest')) for r in rows]
+    now = vals[0] if vals else None; prev = vals[1] if len(vals) > 1 else None
+    return now, pct(now, prev)
 
 
-def _candle_stats(row):
-    o = _f(row.get("open"))
-    h = _f(row.get("high"))
-    l = _f(row.get("low"))
-    c = _f(row.get("close"))
-    r = h - l
-    if r <= 0:
-        return 0.0, 0.0, 0.0, False, 0.0
-    body = abs(c - o)
-    upper = h - max(o, c)
-    lower = min(o, c) - l
-    return (body / r) * 100.0, (upper / r) * 100.0, (lower / r) * 100.0, c >= o, r
+def all_oi(symbol=SYMBOL_PERP):
+    out = {'source_open_interest': 'bybit'}
+    for api_interval, key in {'5min': '5m', '15min': '15m', '30min': '30m', '1h': '1h', '4h': '4h', '1d': '1d'}.items():
+        now, chg = open_interest(symbol, api_interval); out[f'oi_{key}'] = now; out[f'oi_change_{key}_pct'] = chg
+    return out
 
 
-def volume_and_structure(symbol=SYMBOL):
-    k5 = _bybit_klines(symbol, "5", 60)
-    k15 = _bybit_klines(symbol, "15", 60)
-    k60 = _bybit_klines(symbol, "60", 60)
+def orderbook(category, symbol, limit=200):
+    ob = req_bybit(URL_ORDERBOOK, {'category': category, 'symbol': symbol, 'limit': limit})['result']
+    bids = [(f(x[0]), f(x[1])) for x in ob['b']]; asks = [(f(x[0]), f(x[1])) for x in ob['a']]
+    bids = [(p, q) for p, q in bids if p is not None and q is not None]; asks = [(p, q) for p, q in asks if p is not None and q is not None]
+    if not bids or not asks: return {}
+    mid = (bids[0][0] + asks[0][0]) / 2.0
+    def depth_notional(side_rows, pct_band, side):
+        total = 0.0; thr = mid * (1 - pct_band / 100.0) if side == 'bid' else mid * (1 + pct_band / 100.0)
+        for p, q in side_rows:
+            if (side == 'bid' and p >= thr) or (side == 'ask' and p <= thr): total += p * q
+        return total
+    def imbalance(pct_band):
+        b = depth_notional(bids, pct_band, 'bid'); a = depth_notional(asks, pct_band, 'ask')
+        if (a + b) == 0: return None
+        return (b - a) / (b + a) * 100.0
+    return {'orderbook_mid': mid, 'orderbook_imbalance_0_10_pct': imbalance(0.10), 'orderbook_imbalance_0_25_pct': imbalance(0.25), 'orderbook_imbalance_0_50_pct': imbalance(0.50), 'orderbook_imbalance_1_00_pct': imbalance(1.00), 'source_orderbook': 'bybit'}
 
-    last5 = k5[-1] if k5 else {}
-    last15 = k15[-1] if k15 else {}
-    prev5 = k5[-2] if len(k5) >= 2 else {}
-    prev15 = k15[-2] if len(k15) >= 2 else {}
 
-    closes5 = [x["close"] for x in k5]
-    closes15 = [x["close"] for x in k15]
-    closes60 = [x["close"] for x in k60]
+def recent_trades(category, symbol, limit=1000):
+    rows = req_bybit(URL_TRADES, {'category': category, 'symbol': symbol, 'limit': limit})['result']['list']
+    buy_count = sell_count = 0; buy_qty = sell_qty = 0.0; buy_notional = sell_notional = 0.0; large_100k_buy_usd = large_100k_sell_usd = 0.0; signed = []
+    for r in rows:
+        side = fmt_side(r.get('side')); price = f(r.get('price'), 0.0); size = f(r.get('size'), 0.0); notion = price * size
+        if side == 'Buy':
+            buy_count += 1; buy_qty += size; buy_notional += notion; signed.append(notion)
+            if notion >= 100000: large_100k_buy_usd += notion
+        elif side == 'Sell':
+            sell_count += 1; sell_qty += size; sell_notional += notion; signed.append(-notion)
+            if notion >= 100000: large_100k_sell_usd += notion
+    total_count = buy_count + sell_count; total_qty = buy_qty + sell_qty; total_notional = buy_notional + sell_notional
+    cvd_last = sum(signed) if signed else None; cvd_last_100 = sum(signed[-100:]) if signed else None; cvd_last_250 = sum(signed[-250:]) if signed else None
+    cvd_trend = (sum(signed[len(signed)//2:]) - sum(signed[:len(signed)//2])) if len(signed) >= 2 else None
+    return {'recent_trades_count': total_count, 'recent_taker_buy_ratio_pct': None if total_count == 0 else buy_count / total_count * 100.0, 'recent_buy_notional_usd': buy_notional, 'recent_sell_notional_usd': sell_notional, 'recent_notional_delta_pct': None if total_notional == 0 else (buy_notional - sell_notional) / total_notional * 100.0, 'recent_qty_delta_pct': None if total_qty == 0 else (buy_qty - sell_qty) / total_qty * 100.0, 'large_100k_buy_usd': large_100k_buy_usd, 'large_100k_sell_usd': large_100k_sell_usd, 'cvd_last_usd': cvd_last, 'cvd_last_100_usd': cvd_last_100, 'cvd_last_250_usd': cvd_last_250, 'cvd_trend_usd': cvd_trend, 'source_recent_trades': 'bybit'}
 
-    med_turnover_5 = _median([x["turnover"] for x in k5[-20:-1]], 0.0)
-    med_turnover_15 = _median([x["turnover"] for x in k15[-20:-1]], 0.0)
-    med_turnover_1h = _median([x["turnover"] for x in k60[-20:-1]], 0.0)
 
-    med_range_5 = _median([(x["high"] - x["low"]) for x in k5[-20:-1]], 0.0)
-    med_range_15 = _median([(x["high"] - x["low"]) for x in k15[-20:-1]], 0.0)
+def klines(category, symbol, interval, limit):
+    rows = req_bybit(URL_KLINE, {'category': category, 'symbol': symbol, 'interval': interval, 'limit': limit})['result']['list']
+    return [{'ts': int(r[0]), 'open': f(r[1]), 'high': f(r[2]), 'low': f(r[3]), 'close': f(r[4]), 'volume': f(r[5]), 'turnover': f(r[6])} for r in rows]
 
-    range_5 = _f(last5.get("high")) - _f(last5.get("low"))
-    range_15 = _f(last15.get("high")) - _f(last15.get("low"))
 
-    c5_body, c5_up, c5_low, c5_green, c5_range = _candle_stats(last5)
-    c15_body, c15_up, c15_low, c15_green, c15_range = _candle_stats(last15)
+def binance_klines(symbol, interval, limit):
+    rows = req_binance(BINANCE_URL_KLINES, {'symbol': symbol, 'interval': interval, 'limit': limit})
+    return [{'ts': int(r[0]), 'open': f(r[1]), 'high': f(r[2]), 'low': f(r[3]), 'close': f(r[4]), 'volume': f(r[5]), 'turnover': f(r[7])} for r in rows]
 
-    highs12 = [x["high"] for x in k5[-12:]] if len(k5) >= 12 else [x["high"] for x in k5]
-    lows12 = [x["low"] for x in k5[-12:]] if len(k5) >= 12 else [x["low"] for x in k5]
 
-    turns_5 = [x["turnover"] for x in k5[-12:]]
-    turns_15 = [x["turnover"] for x in k15[-12:]]
+def median_turnover_ex_current(candles, lookback):
+    vals = [c['turnover'] for c in candles[1:lookback+1] if c['turnover'] is not None]
+    return median(vals) if vals else None
 
+
+def median_range_ex_current(candles, lookback):
+    vals = [(c['high'] - c['low']) for c in candles[1:lookback+1] if None not in (c['high'], c['low'])]
+    return median(vals) if vals else None
+
+
+def calc_atr(candles, period=14):
+    if len(candles) < period + 1: return None
+    trs = []
+    for i in range(period):
+        cur = candles[i]; prev = candles[i+1]
+        if None in (cur['high'], cur['low'], prev['close']): continue
+        trs.append(max(cur['high'] - cur['low'], abs(cur['high'] - prev['close']), abs(cur['low'] - prev['close'])))
+    return sum(trs) / len(trs) if trs else None
+
+
+def candle_metrics(c):
+    if not c: return {}
+    o, h, l, cl = c['open'], c['high'], c['low'], c['close']
+    if None in (o, h, l, cl): return {}
+    rng = h - l; body = abs(cl - o); upper = h - max(o, cl); lower = min(o, cl) - l
+    return {'body_pct_of_range': None if rng == 0 else body / rng * 100.0, 'upper_wick_pct_of_range': None if rng == 0 else upper / rng * 100.0, 'lower_wick_pct_of_range': None if rng == 0 else lower / rng * 100.0, 'is_green': cl >= o, 'range_abs': rng}
+
+
+def calc_vwap(candles):
+    pv = vol = 0.0
+    for c in candles:
+        if None in (c['high'], c['low'], c['close'], c['volume']): continue
+        typical = (c['high'] + c['low'] + c['close']) / 3.0; pv += typical * c['volume']; vol += c['volume']
+    return None if vol == 0 else pv / vol
+
+
+def volume_and_structure(category, symbol):
+    k5 = klines(category, symbol, '5', 80); k15 = klines(category, symbol, '15', 50); k60 = klines(category, symbol, '60', 30)
+    cur5 = k5[0] if k5 else None; cur15 = k15[0] if k15 else None; cur60 = k60[0] if k60 else None
+    t5 = cur5['turnover'] if cur5 else None; t15 = cur15['turnover'] if cur15 else None; t60 = cur60['turnover'] if cur60 else None
+    med5 = median_turnover_ex_current(k5, 20); med15 = median_turnover_ex_current(k15, 20); med60 = median_turnover_ex_current(k60, 20)
+    medr5 = median_range_ex_current(k5, 20); medr15 = median_range_ex_current(k15, 20)
+    cur5r = None if not cur5 else (cur5['high'] - cur5['low']); cur15r = None if not cur15 else (cur15['high'] - cur15['low'])
+    prev5_high = k5[1]['high'] if len(k5) > 1 else None; prev5_low = k5[1]['low'] if len(k5) > 1 else None; prev15_high = k15[1]['high'] if len(k15) > 1 else None; prev15_low = k15[1]['low'] if len(k15) > 1 else None
+    highs = [c['high'] for c in k5[:12] if c['high'] is not None]; lows = [c['low'] for c in k5[:12] if c['low'] is not None]
+    vwap1 = calc_vwap(k5[:12]); vwap24 = calc_vwap(k60[:24]); last = cur5['close'] if cur5 else None
+    out = {'turnover_5m_usd': t5, 'turnover_15m_usd': t15, 'turnover_1h_usd': t60, 'median_turnover_5m_usd': med5, 'median_turnover_15m_usd': med15, 'median_turnover_1h_usd': med60, 'volume_spike_5m_x': safe_div(t5, med5), 'volume_spike_15m_x': safe_div(t15, med15), 'volume_spike_1h_x': safe_div(t60, med60), 'range_5m': cur5r, 'range_15m': cur15r, 'median_range_5m': medr5, 'median_range_15m': medr15, 'range_expansion_5m_x': safe_div(cur5r, medr5), 'range_expansion_15m_x': safe_div(cur15r, medr15), 'prev_5m_high': prev5_high, 'prev_5m_low': prev5_low, 'prev_15m_high': prev15_high, 'prev_15m_low': prev15_low, 'swing_high_12x5m': max(highs) if highs else None, 'swing_low_12x5m': min(lows) if lows else None, 'vwap_1h': vwap1, 'vwap_24h': vwap24, 'price_vs_vwap_1h_pct': pct(last, vwap1), 'price_vs_vwap_24h_pct': pct(last, vwap24), 'atr_5m': calc_atr(k5, 14), 'atr_15m': calc_atr(k15, 14), 'price_low_2_5m': min([c['low'] for c in k5[:2] if c['low'] is not None], default=None), 'price_low_6_5m': min([c['low'] for c in k5[1:7] if c['low'] is not None], default=None), 'price_high_2_5m': max([c['high'] for c in k5[:2] if c['high'] is not None], default=None), 'price_high_6_5m': max([c['high'] for c in k5[1:7] if c['high'] is not None], default=None), 'vol_declining_5m': True if len(k5) > 2 and all(k5[i]['turnover'] <= k5[i+1]['turnover'] for i in range(0, 2) if None not in (k5[i]['turnover'], k5[i+1]['turnover'])) else False, 'source_structure': 'bybit'}
+    out.update({f'cur5m_{k}': v for k, v in candle_metrics(cur5).items()}); out.update({f'cur15m_{k}': v for k, v in candle_metrics(cur15).items()})
+    return out
+
+
+def spot_perp_divergence():
+    perp = ticker('linear', SYMBOL_PERP)
+    spot = ticker('spot', SYMBOL_SPOT)
+    perp_k5 = klines('linear', SYMBOL_PERP, '5', 2)
+
+    routed_spot_klines, spot_kline_source = resolve_route(
+        'spot_klines',
+        {
+            'binance': lambda: binance_klines(SYMBOL_SPOT, '5m', 2),
+            'bybit': lambda: klines('spot', SYMBOL_SPOT, '5', 2),
+        },
+    )
+    spot_k5 = routed_spot_klines if isinstance(routed_spot_klines, list) else []
+
+    perp_chg = pct(perp_k5[0]['close'], perp_k5[1]['close']) if len(perp_k5) > 1 else None
+    spot_chg = pct(spot_k5[0]['close'], spot_k5[1]['close']) if len(spot_k5) > 1 else None
     return {
-        "turnover_5m_usd": _f(last5.get("turnover")),
-        "turnover_15m_usd": _f(last15.get("turnover")),
-        "turnover_1h_usd": _f(k60[-1]["turnover"]) if k60 else 0.0,
-        "median_turnover_5m_usd": med_turnover_5,
-        "median_turnover_15m_usd": med_turnover_15,
-        "median_turnover_1h_usd": med_turnover_1h,
-        "volume_spike_5m_x": _safe_div(_f(last5.get("turnover")), med_turnover_5, 0.0),
-        "volume_spike_15m_x": _safe_div(_f(last15.get("turnover")), med_turnover_15, 0.0),
-        "volume_spike_1h_x": _safe_div(_f(k60[-1]["turnover"]) if k60 else 0.0, med_turnover_1h, 0.0),
-        "range_5m": range_5,
-        "range_15m": range_15,
-        "median_range_5m": med_range_5,
-        "median_range_15m": med_range_15,
-        "range_expansion_5m_x": _safe_div(range_5, med_range_5, 0.0),
-        "range_expansion_15m_x": _safe_div(range_15, med_range_15, 0.0),
-        "prev_5m_high": _f(prev5.get("high")),
-        "prev_5m_low": _f(prev5.get("low")),
-        "prev_15m_high": _f(prev15.get("high")),
-        "prev_15m_low": _f(prev15.get("low")),
-        "swing_high_12x5m": max(highs12) if highs12 else 0.0,
-        "swing_low_12x5m": min(lows12) if lows12 else 0.0,
-        "vwap_1h": _vwap(k5[-12:]) if len(k5) >= 12 else _vwap(k5),
-        "vwap_24h": _vwap(k60[-24:]) if len(k60) >= 24 else _vwap(k60),
-        "atr_5m": _atr(k5, 14),
-        "atr_15m": _atr(k15, 14),
-        "price_low_2_5m": min([x["low"] for x in k5[-2:]]) if len(k5) >= 2 else 0.0,
-        "price_low_6_5m": min([x["low"] for x in k5[-6:]]) if len(k5) >= 6 else 0.0,
-        "price_high_2_5m": max([x["high"] for x in k5[-2:]]) if len(k5) >= 2 else 0.0,
-        "price_high_6_5m": max([x["high"] for x in k5[-6:]]) if len(k5) >= 6 else 0.0,
-        "vol_declining_5m": len(turns_5) >= 3 and turns_5[-1] < turns_5[-2] < turns_5[-3],
-        "source_structure": "bybit",
-        "cur5m_body_pct_of_range": c5_body,
-        "cur5m_upper_wick_pct_of_range": c5_up,
-        "cur5m_lower_wick_pct_of_range": c5_low,
-        "cur5m_is_green": c5_green,
-        "cur5m_range_abs": c5_range,
-        "cur15m_body_pct_of_range": c15_body,
-        "cur15m_upper_wick_pct_of_range": c15_up,
-        "cur15m_lower_wick_pct_of_range": c15_low,
-        "cur15m_is_green": c15_green,
-        "cur15m_range_abs": c15_range,
-        "trend_5m": _trend_label(closes5),
-        "trend_15m": _trend_label(closes15),
-        "trend_1h": _trend_label(closes60),
+        'spot_last': spot.get('last'),
+        'spot_chg24_pct': spot.get('chg24_pct'),
+        'spot_turnover24_usd': spot.get('turnover24_usd'),
+        'spot_volume24_btc': spot.get('volume24'),
+        'perp_spot_last_spread_pct': pct(perp.get('last'), spot.get('last')),
+        'perp_5m_chg_pct': perp_chg,
+        'spot_5m_chg_pct': spot_chg,
+        'spot_perp_divergence_5m_pct_pt': None if None in (perp_chg, spot_chg) else (perp_chg - spot_chg),
+        'source_perp_context': perp.get('source_ticker'),
+        'source_spot_context': spot.get('source_spot_ticker'),
+        'source_spot_klines': spot_kline_source,
     }
 
 
-def spot_perp_divergence(symbol=SYMBOL):
-    t24 = req_binance(URL_BINANCE_TICKER_24H, {"symbol": symbol})
-    spot_last_row = req_binance(URL_BINANCE_TICKER_PRICE, {"symbol": symbol})
-    kl5 = req_binance(URL_BINANCE_KLINES, {"symbol": symbol, "interval": "5m", "limit": 3})
-
-    spot_last = _f(spot_last_row.get("price"))
-    spot_chg24_pct = _f(t24.get("priceChangePercent"))
-    spot_turnover24 = _f(t24.get("quoteVolume"))
-    spot_volume24 = _f(t24.get("volume"))
-
-    close_prev = _f(kl5[-2][4]) if len(kl5) >= 2 else spot_last
-    close_last = _f(kl5[-1][4]) if len(kl5) >= 1 else spot_last
-    spot_5m_chg = _pct_change(close_last, close_prev, 0.0)
-
-    perp = ticker(symbol)
-    perp_last = _f(perp.get("last"))
-    perp_5m_chg = _pct_change(perp_last, _f(perp_last) - 1.0, 0.0)
-
-    return {
-        "spot_last": spot_last,
-        "spot_chg24_pct": spot_chg24_pct,
-        "spot_turnover24_usd": spot_turnover24,
-        "spot_volume24_btc": spot_volume24,
-        "perp_spot_last_spread_pct": _pct_change(perp_last, spot_last, 0.0),
-        "perp_5m_chg_pct": perp_5m_chg,
-        "spot_5m_chg_pct": spot_5m_chg,
-        "spot_perp_divergence_5m_pct_pt": perp_5m_chg - spot_5m_chg,
-        "source_perp_context": "bybit",
-        "source_spot_context": "binance",
-        "source_spot_klines": "binance",
-    }
-
-
-def liquidation_tracker_best_effort(symbol=SYMBOL):
-    return {
-        "liq_capture_window_sec": 8,
-        "liq_available": False,
-        "long_liq_usd_5m": None,
-        "short_liq_usd_5m": None,
-        "liq_imbalance_pct": None,
-    }
+def liquidation_tracker_best_effort(duration_sec=8):
+    out = {'liq_capture_window_sec': duration_sec, 'liq_available': False, 'long_liq_usd_5m': None, 'short_liq_usd_5m': None, 'liq_imbalance_pct': None}
+    try: import websocket
+    except Exception: return out
+    collected = []
+    def on_message(ws, message):
+        try:
+            data = json.loads(message); topic = data.get('topic', '')
+            if 'liquidation' not in topic.lower(): return
+            rows = data.get('data', [])
+            if isinstance(rows, dict): rows = [rows]
+            for r in rows:
+                if r.get('symbol') != SYMBOL_PERP: continue
+                side = fmt_side(r.get('side')); price = f(r.get('price'), 0.0); size = f(r.get('size'), 0.0); collected.append({'side': side, 'usd': price * size})
+        except Exception: pass
+    def on_open(ws):
+        try: ws.send(json.dumps({'op': 'subscribe', 'args': ['liquidation.BTCUSDT', 'allLiquidation.BTCUSDT']}))
+        except Exception: pass
+    def runner():
+        ws = websocket.WebSocketApp(WS_PUBLIC, on_open=on_open, on_message=on_message)
+        try: ws.run_forever(sslopt={'cert_reqs': ssl.CERT_NONE}, ping_interval=20, ping_timeout=10)
+        except Exception: pass
+    t = threading.Thread(target=runner, daemon=True); t.start(); time.sleep(duration_sec)
+    long_liq = short_liq = 0.0
+    for x in collected:
+        if x['side'] == 'Sell': long_liq += x['usd']
+        elif x['side'] == 'Buy': short_liq += x['usd']
+    total = long_liq + short_liq; imbalance = None if total == 0 else (short_liq - long_liq) / total * 100.0
+    out.update({'liq_available': True, 'long_liq_usd_5m': long_liq, 'short_liq_usd_5m': short_liq, 'liq_imbalance_pct': imbalance, 'source_liquidations': 'bybit_ws'})
+    return out
 
 
 def global_data():
-    data = req(URL_GLOBAL)
-    d = data.get("data", {})
-    return {
-        "total_mcap_usd": _f(d.get("total_market_cap", {}).get("usd")),
-        "btc_dom_pct": _f(d.get("market_cap_percentage", {}).get("btc")),
-    }
+    d = SESSION.get(URL_GLOBAL, timeout=12).json()['data']
+    return {'total_mcap_usd': f(d['total_market_cap']['usd']), 'btc_dom_pct': f(d['market_cap_percentage']['btc'])}
