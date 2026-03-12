@@ -46,6 +46,11 @@ from btc_pro_state import (
     final_path_decision, canonical_final_decision,
 )
 
+RETEST_READY_ACTIONS = {
+    'SHORT_RETEST_READY',
+    'LONG_RETEST_READY',
+}
+
 
 def _f(v):
     try:
@@ -279,7 +284,7 @@ def _trade_plan_confidence(d, side):
     base -= signal_conflict * 0.12
     base -= penalty * 0.18
     base -= late * 0.12
-    if d.get('canonical_final_action') in ('SHORT_RETEST_READY', 'LONG_RETEST_READY', 'SHORT_RETEST_READY', 'LONG_RETEST_READY'):
+    if d.get('canonical_final_action') in RETEST_READY_ACTIONS:
         base += 8
     if side == 'short' and d.get('short_path_valid'):
         base += 6
