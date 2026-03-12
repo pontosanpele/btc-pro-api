@@ -248,6 +248,8 @@ def orderbook_wall_tracker(d):
 
 def trigger_engine(d):
     last = d.get('last')
+    bull_trigger = d.get('liq_above_htf') or d.get('prev_1h_high') or d.get('liq_above_1') or d.get('prev_15m_high') or d.get('prev_5m_high')
+    bear_trigger = d.get('liq_below_htf') or d.get('prev_1h_low') or d.get('liq_below_1') or d.get('prev_15m_low') or d.get('prev_5m_low')
     bull_trigger = d.get('liq_above_1') or d.get('prev_15m_high') or d.get('prev_5m_high')
     bear_trigger = d.get('liq_below_1') or d.get('prev_15m_low') or d.get('prev_5m_low')
     # Entry-side anchors:
