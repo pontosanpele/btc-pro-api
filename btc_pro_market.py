@@ -543,5 +543,20 @@ def stop_liquidation_tracker():
 
 
 def global_data():
-    d = SESSION.get(URL_GLOBAL, timeout=12).json()['data']
-    return {'total_mcap_usd': f(d['total_market_cap']['usd']), 'btc_dom_pct': f(d['market_cap_percentage']['btc'])}
+    fallback = {
+        'total_mcap_usd': None,
+        'btc_dom_pct': None,
+        'source_global_status': 'unavailable',
+    }
+    try:
+        response = SESSION.get(URL_GLOBAL, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        d = payload['data']
+        return {
+            'total_mcap_usd': f(d['total_market_cap']['usd']),
+            'btc_dom_pct': f(d['market_cap_percentage']['btc']),
+            'source_global_status': 'ok',
+        }
+    except Exception:
+        return fallback
