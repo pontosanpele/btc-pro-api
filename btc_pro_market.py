@@ -3,6 +3,7 @@ from collections import deque
 from statistics import median
 from btc_pro_config import (
     BINANCE_URL_BOOK_TICKER,
+    BINANCE_URL_DEPTH,
     BINANCE_URL_KLINES,
     BINANCE_URL_TICKER_24H,
     CME_BTC_BENCHMARK_URL,
@@ -265,22 +266,67 @@ def all_oi(symbol=SYMBOL_PERP):
     return out
 
 
-def orderbook(category, symbol, limit=200):
-    ob = req_bybit(URL_ORDERBOOK, {'category': category, 'symbol': symbol, 'limit': limit})['result']
-    bids = [(f(x[0]), f(x[1])) for x in ob['b']]; asks = [(f(x[0]), f(x[1])) for x in ob['a']]
-    bids = [(p, q) for p, q in bids if p is not None and q is not None]; asks = [(p, q) for p, q in asks if p is not None and q is not None]
-    if not bids or not asks: return {}
+def _book_stats(bids, asks, source_name):
+    bids = [(p, q) for p, q in bids if p is not None and q is not None]
+    asks = [(p, q) for p, q in asks if p is not None and q is not None]
+    if not bids or not asks:
+        return {}
     mid = (bids[0][0] + asks[0][0]) / 2.0
+
     def depth_notional(side_rows, pct_band, side):
-        total = 0.0; thr = mid * (1 - pct_band / 100.0) if side == 'bid' else mid * (1 + pct_band / 100.0)
+        total = 0.0
+        thr = mid * (1 - pct_band / 100.0) if side == 'bid' else mid * (1 + pct_band / 100.0)
         for p, q in side_rows:
-            if (side == 'bid' and p >= thr) or (side == 'ask' and p <= thr): total += p * q
+            if (side == 'bid' and p >= thr) or (side == 'ask' and p <= thr):
+                total += p * q
         return total
+
     def imbalance(pct_band):
-        b = depth_notional(bids, pct_band, 'bid'); a = depth_notional(asks, pct_band, 'ask')
-        if (a + b) == 0: return None
+        b = depth_notional(bids, pct_band, 'bid')
+        a = depth_notional(asks, pct_band, 'ask')
+        if (a + b) == 0:
+            return None
         return (b - a) / (b + a) * 100.0
-    return {'orderbook_mid': mid, 'orderbook_imbalance_0_10_pct': imbalance(0.10), 'orderbook_imbalance_0_25_pct': imbalance(0.25), 'orderbook_imbalance_0_50_pct': imbalance(0.50), 'orderbook_imbalance_1_00_pct': imbalance(1.00), 'source_orderbook': 'bybit'}
+
+    bid_wall_price, bid_wall_usd = max(((p, p * q) for p, q in bids[:40]), key=lambda x: x[1], default=(None, None))
+    ask_wall_price, ask_wall_usd = max(((p, p * q) for p, q in asks[:40]), key=lambda x: x[1], default=(None, None))
+    return {
+        'orderbook_mid': mid,
+        'orderbook_imbalance_0_10_pct': imbalance(0.10),
+        'orderbook_imbalance_0_25_pct': imbalance(0.25),
+        'orderbook_imbalance_0_50_pct': imbalance(0.50),
+        'orderbook_imbalance_1_00_pct': imbalance(1.00),
+        'largest_bid_wall_price': bid_wall_price,
+        'largest_ask_wall_price': ask_wall_price,
+        'largest_bid_wall_usd': bid_wall_usd,
+        'largest_ask_wall_usd': ask_wall_usd,
+        'source_orderbook': source_name,
+    }
+
+
+def bybit_orderbook(category, symbol, limit=200):
+    ob = req_bybit(URL_ORDERBOOK, {'category': category, 'symbol': symbol, 'limit': limit})['result']
+    bids = [(f(x[0]), f(x[1])) for x in ob.get('b', [])]
+    asks = [(f(x[0]), f(x[1])) for x in ob.get('a', [])]
+    return _book_stats(bids, asks, 'bybit')
+
+
+def binance_orderbook(symbol, limit=200):
+    ob = req_binance(BINANCE_URL_DEPTH, {'symbol': symbol, 'limit': min(limit, 1000)})
+    bids = [(f(x[0]), f(x[1])) for x in ob.get('bids', [])]
+    asks = [(f(x[0]), f(x[1])) for x in ob.get('asks', [])]
+    return _book_stats(bids, asks, 'binance')
+
+
+def orderbook(category, symbol, limit=200):
+    routed, source = resolve_route(
+        'orderbook',
+        {
+            'bybit': lambda: bybit_orderbook(category, symbol, limit),
+            'binance': lambda: binance_orderbook(symbol, limit),
+        },
+    )
+    return attach_source(routed, source, 'orderbook')
 
 
 def recent_trades(category, symbol, limit=1000):

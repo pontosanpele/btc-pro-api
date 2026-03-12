@@ -74,6 +74,149 @@ def _coalesce(*vals):
     return None
 
 
+def _btc_rows(history_rows):
+    rows = []
+    for row in history_rows or []:
+        if isinstance(row, dict):
+            btc = row.get('btc', {})
+            if isinstance(btc, dict):
+                rows.append(btc)
+    return rows
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _cluster_levels(levels, bucket_size):
+    buckets = {}
+    for level in levels:
+        if level is None:
+            continue
+        bucket = round(level / bucket_size) * bucket_size
+        agg = buckets.setdefault(bucket, {'count': 0, 'sum': 0.0})
+        agg['count'] += 1
+        agg['sum'] += level
+    ranked = sorted(
+        (
+            {
+                'level': round(v['sum'] / v['count'], 2),
+                'touches': v['count'],
+                'bucket': k,
+            }
+            for k, v in buckets.items()
+        ),
+        key=lambda x: (-x['touches'], x['level'])
+    )
+    return ranked
+
+
+def historical_sr_context(d, history_rows, lookback=72):
+    last = _to_float(d.get('last'))
+    if last is None or last <= 0:
+        return {
+            'historical_resistance_levels': [],
+            'historical_support_levels': [],
+            'nearest_historical_resistance': None,
+            'nearest_historical_support': None,
+            'nearest_resistance_distance_pct': None,
+            'nearest_support_distance_pct': None,
+            'liquidity_resistance_level': None,
+            'liquidity_support_level': None,
+            'liquidity_resistance_distance_pct': None,
+            'liquidity_support_distance_pct': None,
+            'liquidity_resistance_strength': None,
+            'liquidity_support_strength': None,
+            'historical_sr_block_long': False,
+            'historical_sr_block_short': False,
+            'historical_sr_reason': [],
+        }
+
+    rows = _btc_rows(history_rows)[-lookback:]
+    resistances = []
+    supports = []
+    for row in rows:
+        resistances.extend([
+            _to_float(row.get('resistance_zone_high')),
+            _to_float(row.get('resistance_zone_center')),
+            _to_float(row.get('swing_high_12x5m')),
+            _to_float(row.get('prev_15m_high')),
+            _to_float(row.get('prev_5m_high')),
+        ])
+        supports.extend([
+            _to_float(row.get('support_zone_low')),
+            _to_float(row.get('support_zone_center')),
+            _to_float(row.get('swing_low_12x5m')),
+            _to_float(row.get('prev_15m_low')),
+            _to_float(row.get('prev_5m_low')),
+        ])
+
+    liq_res = _to_float(d.get('largest_ask_wall_price'))
+    liq_sup = _to_float(d.get('largest_bid_wall_price'))
+    ask_wall_usd = _to_float(d.get('largest_ask_wall_usd')) or 0.0
+    bid_wall_usd = _to_float(d.get('largest_bid_wall_usd')) or 0.0
+    liq_ratio_ask_to_bid = ask_wall_usd / bid_wall_usd if bid_wall_usd > 0 else None
+    liq_ratio_bid_to_ask = bid_wall_usd / ask_wall_usd if ask_wall_usd > 0 else None
+
+    if liq_res is not None and liq_res > 0:
+        resistances.append(liq_res)
+    if liq_sup is not None and liq_sup > 0:
+        supports.append(liq_sup)
+
+    resistances = [x for x in resistances if x is not None and x > 0]
+    supports = [x for x in supports if x is not None and x > 0]
+    bucket_size = max(25.0, last * 0.0008)
+    resistance_clusters = _cluster_levels(resistances, bucket_size)
+    support_clusters = _cluster_levels(supports, bucket_size)
+
+    nearest_res = min((c for c in resistance_clusters if c['level'] >= last), key=lambda c: c['level'] - last, default=None)
+    nearest_sup = min((c for c in support_clusters if c['level'] <= last), key=lambda c: last - c['level'], default=None)
+
+    res_dist_pct = None if nearest_res is None else (nearest_res['level'] - last) / last * 100.0
+    sup_dist_pct = None if nearest_sup is None else (last - nearest_sup['level']) / last * 100.0
+
+    liq_res_dist_pct = None if liq_res is None else (liq_res - last) / last * 100.0
+    liq_sup_dist_pct = None if liq_sup is None else (last - liq_sup) / last * 100.0
+
+    strong_hist_res = bool(nearest_res and nearest_res['touches'] >= 2 and res_dist_pct is not None and res_dist_pct <= 0.40)
+    strong_hist_sup = bool(nearest_sup and nearest_sup['touches'] >= 2 and sup_dist_pct is not None and sup_dist_pct <= 0.40)
+    strong_liq_res = bool(liq_res_dist_pct is not None and 0 <= liq_res_dist_pct <= 0.35 and liq_ratio_ask_to_bid is not None and liq_ratio_ask_to_bid >= 1.25)
+    strong_liq_sup = bool(liq_sup_dist_pct is not None and 0 <= liq_sup_dist_pct <= 0.35 and liq_ratio_bid_to_ask is not None and liq_ratio_bid_to_ask >= 1.25)
+
+    long_block = strong_hist_res or strong_liq_res
+    short_block = strong_hist_sup or strong_liq_sup
+    reason = []
+    if strong_hist_res:
+        reason.append('near_historical_resistance_block_long')
+    if strong_liq_res:
+        reason.append('near_liquidity_resistance_block_long')
+    if strong_hist_sup:
+        reason.append('near_historical_support_block_short')
+    if strong_liq_sup:
+        reason.append('near_liquidity_support_block_short')
+
+    return {
+        'historical_resistance_levels': resistance_clusters[:6],
+        'historical_support_levels': support_clusters[:6],
+        'nearest_historical_resistance': nearest_res,
+        'nearest_historical_support': nearest_sup,
+        'nearest_resistance_distance_pct': round(res_dist_pct, 4) if res_dist_pct is not None else None,
+        'nearest_support_distance_pct': round(sup_dist_pct, 4) if sup_dist_pct is not None else None,
+        'liquidity_resistance_level': liq_res,
+        'liquidity_support_level': liq_sup,
+        'liquidity_resistance_distance_pct': round(liq_res_dist_pct, 4) if liq_res_dist_pct is not None else None,
+        'liquidity_support_distance_pct': round(liq_sup_dist_pct, 4) if liq_sup_dist_pct is not None else None,
+        'liquidity_resistance_strength': round(liq_ratio_ask_to_bid, 4) if liq_ratio_ask_to_bid is not None else None,
+        'liquidity_support_strength': round(liq_ratio_bid_to_ask, 4) if liq_ratio_bid_to_ask is not None else None,
+        'historical_sr_block_long': long_block,
+        'historical_sr_block_short': short_block,
+        'historical_sr_reason': reason,
+    }
+
+
 def session_context(now_dt):
     hour = now_dt.hour
     if now_dt.weekday() >= 5:
@@ -278,6 +421,20 @@ def build_trade_report(d):
         'short_sl': d.get('atr_stop_short'),
         'short_tp1': d.get('target_short_1'),
         'short_tp2': d.get('target_short_2'),
+        'nearest_historical_resistance': d.get('nearest_historical_resistance'),
+        'nearest_historical_support': d.get('nearest_historical_support'),
+        'nearest_resistance_distance_pct': d.get('nearest_resistance_distance_pct'),
+        'nearest_support_distance_pct': d.get('nearest_support_distance_pct'),
+        'historical_sr_block_long': d.get('historical_sr_block_long'),
+        'historical_sr_block_short': d.get('historical_sr_block_short'),
+        'liquidity_resistance_level': d.get('liquidity_resistance_level'),
+        'liquidity_support_level': d.get('liquidity_support_level'),
+        'liquidity_resistance_distance_pct': d.get('liquidity_resistance_distance_pct'),
+        'liquidity_support_distance_pct': d.get('liquidity_support_distance_pct'),
+        'liquidity_resistance_strength': d.get('liquidity_resistance_strength'),
+        'liquidity_support_strength': d.get('liquidity_support_strength'),
+        'source_orderbook': d.get('source_orderbook_resolved') or d.get('source_orderbook'),
+        'prev_trade_bias': d.get('prev_trade_bias'),
         'setup_grade': 'B',
         'verdict': verdict,
     }
@@ -309,9 +466,42 @@ def _trade_plan_confidence(d, side):
     return round(clamp(base, 0, 100), 2)
 
 
+def _liquidity_flip_guard(d, side):
+    prev_side = d.get('prev_trade_bias')
+    if side not in ('long', 'short'):
+        return side, None
+    if prev_side not in ('long', 'short') or prev_side == side:
+        return side, None
+
+    liq_sup_strength = _f(d.get('liquidity_support_strength')) or 0.0
+    liq_res_strength = _f(d.get('liquidity_resistance_strength')) or 0.0
+    liq_sup_dist = _f(d.get('liquidity_support_distance_pct'))
+    liq_res_dist = _f(d.get('liquidity_resistance_distance_pct'))
+
+    strong_long_confirmation = (
+        liq_sup_strength >= 1.45 and
+        liq_sup_dist is not None and
+        0 <= liq_sup_dist <= 0.45
+    )
+    strong_short_confirmation = (
+        liq_res_strength >= 1.45 and
+        liq_res_dist is not None and
+        0 <= liq_res_dist <= 0.45
+    )
+
+    if side == 'long' and not strong_long_confirmation:
+        return prev_side, 'flip_blocked_wait_stronger_bid_liquidity'
+    if side == 'short' and not strong_short_confirmation:
+        return prev_side, 'flip_blocked_wait_stronger_ask_liquidity'
+    return side, None
+
+
 def trade_plan_generator(d):
     side = d.get('trade_bias')
     cancel = []
+    side, flip_reason = _liquidity_flip_guard(d, side)
+    if flip_reason:
+        cancel.append(flip_reason)
     if d.get('trade_plan_invalidated'):
         side = 'no_trade'
         cancel.append('trade_plan_invalidated')
@@ -322,6 +512,14 @@ def trade_plan_generator(d):
         side = 'no_trade'; cancel.append('bull_trap_risk')
     if d.get('trap_alert') == 'bear_trap_risk' and side == 'short':
         side = 'no_trade'; cancel.append('bear_trap_risk')
+    if d.get('historical_sr_block_long') and side == 'long':
+        side = 'no_trade'
+        long_reasons = [x for x in (d.get('historical_sr_reason') or []) if str(x).endswith('_long')]
+        cancel.extend(long_reasons or ['near_historical_resistance_block_long'])
+    if d.get('historical_sr_block_short') and side == 'short':
+        side = 'no_trade'
+        short_reasons = [x for x in (d.get('historical_sr_reason') or []) if str(x).endswith('_short')]
+        cancel.extend(short_reasons or ['near_historical_support_block_short'])
 
     if side == 'long':
         zone = d.get('long_entry_zone_aggressive') or d.get('long_entry_zone')
@@ -441,6 +639,7 @@ def build_snapshot():
     btc.update(hard_gate_evaluation(btc))
     btc.update(soft_score_stack(btc))
     btc.update(market_vs_trade_read(btc))
+    btc.update(historical_sr_context(btc, hist))
 
     btc.update(trade_lifecycle_state(btc))
     btc.update(setup_classifier(btc))
