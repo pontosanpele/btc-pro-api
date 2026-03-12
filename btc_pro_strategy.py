@@ -6,7 +6,7 @@ from btc_pro_history import append_history, compare_to_previous, load_history
 from btc_pro_metrics import normalized_market_context, interaction_scores
 from btc_pro_market import (
     all_oi, funding_history, global_data, instrument_info,
-    liquidation_tracker_best_effort, orderbook, recent_trades,
+    liquidation_tracker, orderbook, recent_trades,
     spot_perp_divergence, ticker, volume_and_structure,
 )
 from btc_pro_signals import (
@@ -352,7 +352,7 @@ def build_snapshot():
     btc.update(recent_trades('linear', SYMBOL_PERP, 1000))
     btc.update(volume_and_structure('linear', SYMBOL_PERP))
     btc.update(spot_perp_divergence())
-    btc.update(liquidation_tracker_best_effort(duration_sec=8))
+    btc.update(liquidation_tracker(window_sec=300))
     btc.update(session_context(now))
 
     btc.update(chop_filter(btc))

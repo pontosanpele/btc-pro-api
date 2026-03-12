@@ -1,4 +1,5 @@
-import json, re, ssl, threading, time
+import atexit, json, re, ssl, threading, time
+from collections import deque
 from statistics import median
 from btc_pro_config import (
     BINANCE_URL_BOOK_TICKER,
@@ -391,36 +392,154 @@ def spot_perp_divergence():
     }
 
 
-def liquidation_tracker_best_effort(duration_sec=8):
-    out = {'liq_capture_window_sec': duration_sec, 'liq_available': False, 'long_liq_usd_5m': None, 'short_liq_usd_5m': None, 'liq_imbalance_pct': None}
-    try: import websocket
-    except Exception: return out
-    collected = []
-    def on_message(ws, message):
+class _LiquidationFeedService:
+    def __init__(self, symbol=SYMBOL_PERP, max_window_sec=1800):
+        self.symbol = symbol
+        self.max_window_sec = max_window_sec
+        self._events = deque()
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._ws = None
+        self._connected = False
+        self._ever_connected = False
+
+    def start(self):
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run_loop, name='liq-feed', daemon=True)
+            self._thread.start()
+
+    def stop(self, join_timeout=3.0):
+        with self._lock:
+            self._stop_event.set()
+            ws = self._ws
+            th = self._thread
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        if th is not None and th.is_alive():
+            th.join(timeout=join_timeout)
+
+    def snapshot(self, window_sec=300):
+        window_sec = max(int(window_sec), 1)
+        now = time.time()
+        cutoff = now - window_sec
+        with self._lock:
+            self._prune_locked(now)
+            rows = list(self._events)
+            connected = self._connected
+            ever_connected = self._ever_connected
+        long_liq = short_liq = 0.0
+        for ts, side, usd in rows:
+            if ts < cutoff:
+                continue
+            if side == 'Sell':
+                long_liq += usd
+            elif side == 'Buy':
+                short_liq += usd
+        total = long_liq + short_liq
+        return {
+            'liq_capture_window_sec': window_sec,
+            'liq_available': connected or ever_connected,
+            'long_liq_usd_5m': long_liq,
+            'short_liq_usd_5m': short_liq,
+            'liq_imbalance_pct': None if total == 0 else (short_liq - long_liq) / total * 100.0,
+            'source_liquidations': 'bybit_ws_cache',
+            'liq_ws_connected': connected,
+        }
+
+    def _run_loop(self):
         try:
-            data = json.loads(message); topic = data.get('topic', '')
-            if 'liquidation' not in topic.lower(): return
+            import websocket
+        except Exception:
+            return
+
+        backoff = 1.0
+        while not self._stop_event.is_set():
+            app = websocket.WebSocketApp(
+                WS_PUBLIC,
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_close=self._on_close,
+                on_error=self._on_error,
+            )
+            with self._lock:
+                self._ws = app
+            try:
+                app.run_forever(sslopt={'cert_reqs': ssl.CERT_NONE}, ping_interval=20, ping_timeout=10)
+            except Exception:
+                pass
+            with self._lock:
+                self._ws = None
+                self._connected = False
+            if self._stop_event.is_set():
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 15.0)
+
+    def _on_open(self, ws):
+        sub_symbol = (self.symbol or '').upper()
+        args = [f'liquidation.{sub_symbol}', f'allLiquidation.{sub_symbol}']
+        try:
+            ws.send(json.dumps({'op': 'subscribe', 'args': args}))
+        except Exception:
+            return
+        with self._lock:
+            self._connected = True
+            self._ever_connected = True
+
+    def _on_close(self, ws, status_code, msg):
+        with self._lock:
+            self._connected = False
+
+    def _on_error(self, ws, error):
+        with self._lock:
+            self._connected = False
+
+    def _on_message(self, ws, message):
+        try:
+            data = json.loads(message)
+            topic = data.get('topic', '')
+            if 'liquidation' not in topic.lower():
+                return
             rows = data.get('data', [])
-            if isinstance(rows, dict): rows = [rows]
-            for r in rows:
-                if r.get('symbol') != SYMBOL_PERP: continue
-                side = fmt_side(r.get('side')); price = f(r.get('price'), 0.0); size = f(r.get('size'), 0.0); collected.append({'side': side, 'usd': price * size})
-        except Exception: pass
-    def on_open(ws):
-        try: ws.send(json.dumps({'op': 'subscribe', 'args': ['liquidation.BTCUSDT', 'allLiquidation.BTCUSDT']}))
-        except Exception: pass
-    def runner():
-        ws = websocket.WebSocketApp(WS_PUBLIC, on_open=on_open, on_message=on_message)
-        try: ws.run_forever(sslopt={'cert_reqs': ssl.CERT_NONE}, ping_interval=20, ping_timeout=10)
-        except Exception: pass
-    t = threading.Thread(target=runner, daemon=True); t.start(); time.sleep(duration_sec)
-    long_liq = short_liq = 0.0
-    for x in collected:
-        if x['side'] == 'Sell': long_liq += x['usd']
-        elif x['side'] == 'Buy': short_liq += x['usd']
-    total = long_liq + short_liq; imbalance = None if total == 0 else (short_liq - long_liq) / total * 100.0
-    out.update({'liq_available': True, 'long_liq_usd_5m': long_liq, 'short_liq_usd_5m': short_liq, 'liq_imbalance_pct': imbalance, 'source_liquidations': 'bybit_ws'})
-    return out
+            if isinstance(rows, dict):
+                rows = [rows]
+            now = time.time()
+            with self._lock:
+                for r in rows:
+                    if r.get('symbol') != self.symbol:
+                        continue
+                    side = fmt_side(r.get('side'))
+                    price = f(r.get('price'), 0.0)
+                    size = f(r.get('size'), 0.0)
+                    self._events.append((now, side, price * size))
+                self._prune_locked(now)
+        except Exception:
+            pass
+
+    def _prune_locked(self, now_ts):
+        cutoff = now_ts - self.max_window_sec
+        while self._events and self._events[0][0] < cutoff:
+            self._events.popleft()
+
+
+_LIQ_SERVICE = _LiquidationFeedService()
+_LIQ_SERVICE.start()
+atexit.register(_LIQ_SERVICE.stop)
+
+
+def liquidation_tracker(window_sec=300):
+    return _LIQ_SERVICE.snapshot(window_sec=window_sec)
+
+
+def stop_liquidation_tracker():
+    _LIQ_SERVICE.stop()
 
 
 def global_data():
