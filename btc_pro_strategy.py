@@ -85,13 +85,27 @@ def session_context(now_dt):
 def data_quality(snapshot):
     missing = []
     btc = snapshot.get('btc', {})
+    global_ctx = snapshot.get('global', {})
     for k in ['last', 'funding_pct', 'oi_change_5m_pct', 'recent_notional_delta_pct', 'volume_spike_5m_x', 'orderbook_imbalance_0_25_pct', 'vwap_1h']:
         if btc.get(k) is None:
             missing.append(k)
+
     score = 100 - len(missing) * 8
     if btc.get('liq_available') is False:
         score -= 10
-    return {'data_quality_score': max(score, 0), 'missing_modules': missing, 'ws_liq_status': 'ok' if btc.get('liq_available') else 'missing_or_inactive'}
+
+    global_available = snapshot.get('global_data_available')
+    if global_available is None:
+        global_available = (global_ctx.get('source_global_status') == 'ok')
+    if not global_available:
+        score -= 5
+
+    return {
+        'data_quality_score': max(score, 0),
+        'missing_modules': missing,
+        'ws_liq_status': 'ok' if btc.get('liq_available') else 'missing_or_inactive',
+        'global_data_status': 'ok' if global_available else 'degraded',
+    }
 
 
 def early_setup_detector(d):
@@ -443,7 +457,21 @@ def build_snapshot():
     btc.update(build_trade_report(btc))
 
     out['btc'] = btc
-    out['global'] = global_data()
+    out['global_data_available'] = True
+    out['global_data_error'] = None
+    try:
+        out['global'] = global_data()
+        if out['global'].get('source_global_status') != 'ok':
+            out['global_data_available'] = False
+            out['global_data_error'] = 'global_data_unavailable'
+    except Exception as e:
+        out['global_data_available'] = False
+        out['global_data_error'] = str(e)
+        out['global'] = {
+            'total_mcap_usd': None,
+            'btc_dom_pct': None,
+            'source_global_status': 'exception',
+        }
     out.update(data_quality(out))
 
     metrics = compare_to_previous(out, hist)
