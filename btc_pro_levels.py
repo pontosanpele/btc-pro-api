@@ -264,6 +264,17 @@ def trigger_engine(d):
 
     # Ne legyen túl közel egymáshoz a long/short belépő: 15m ATR + minimum %-os sáv.
     min_gap = None
+    min_offset_from_price = None
+    if last is not None:
+        atr15_base = atr15 if atr15 is not None else 0.0
+        min_gap = max(atr15_base * 0.95, last * 0.0048)
+        min_offset_from_price = max(atr15_base * 0.55, last * 0.0028)
+
+    # Kreatív stabilizáció: az entry-triggerek ne legyenek túl közel a pillanatnyi árhoz.
+    if None not in (last, bull_trigger, min_offset_from_price):
+        bull_trigger = min(bull_trigger, last - min_offset_from_price)
+    if None not in (last, bear_trigger, min_offset_from_price):
+        bear_trigger = max(bear_trigger, last + min_offset_from_price)
     if last is not None:
         atr15_base = atr15 if atr15 is not None else 0.0
         min_gap = max(atr15_base * 0.95, last * 0.0048)
@@ -287,6 +298,8 @@ def trigger_engine(d):
         'bear_trigger_price': bear_trigger,
         'trigger_min_separation_abs': min_gap,
         'trigger_min_separation_pct': (min_gap / last * 100.0) if None not in (min_gap, last) and last != 0 else None,
+        'trigger_min_offset_from_price_abs': min_offset_from_price,
+        'trigger_min_offset_from_price_pct': (min_offset_from_price / last * 100.0) if None not in (min_offset_from_price, last) and last != 0 else None,
         'invalidation_long': swing_low,
         'invalidation_short': swing_high,
         'atr_stop_long': last - atr5 * 1.2 if None not in (last, atr5) else None,

@@ -284,6 +284,7 @@ def early_setup_detector(d):
 
 
 def directional_entry_zones(d):
+    last = _f(d.get('last'))
     bull = _f(d.get('bull_trigger_price'))
     bear = _f(d.get('bear_trigger_price'))
     support_lo = _f(d.get('support_zone_low'))
@@ -299,6 +300,7 @@ def directional_entry_zones(d):
     atr15 = _f(d.get('atr_15m')) or atr5
     width = max(atr5 * 0.18, 20.0)
     min_sep = max(_f(d.get('trigger_min_separation_abs')) or 0.0, atr15 * 0.55, 35.0)
+    price_buffer = max(_f(d.get('trigger_min_offset_from_price_abs')) or 0.0, atr15 * 0.35, 22.0)
 
     long_counter = d.get('dominant_bias_htf') == 'short'
     short_counter = d.get('dominant_bias_htf') == 'long'
@@ -352,6 +354,23 @@ def directional_entry_zones(d):
             if short_cons:
                 short_cons = _zone([short_cons[0] + push, short_cons[1] + push])
 
+    # No-trade corridor az aktuális ár körül: long zóna maradjon ár alatt, short zóna ár felett.
+    if last is not None:
+        if long_main and long_main[1] >= last - price_buffer:
+            shift = long_main[1] - (last - price_buffer)
+            long_main = _zone([long_main[0] - shift, long_main[1] - shift])
+            if long_aggr:
+                long_aggr = _zone([long_aggr[0] - shift, long_aggr[1] - shift])
+            if long_cons:
+                long_cons = _zone([long_cons[0] - shift, long_cons[1] - shift])
+        if short_main and short_main[0] <= last + price_buffer:
+            shift = (last + price_buffer) - short_main[0]
+            short_main = _zone([short_main[0] + shift, short_main[1] + shift])
+            if short_aggr:
+                short_aggr = _zone([short_aggr[0] + shift, short_aggr[1] + shift])
+            if short_cons:
+                short_cons = _zone([short_cons[0] + shift, short_cons[1] + shift])
+
     return {
         'long_entry_zone': long_main,
         'short_entry_zone': short_main,
@@ -362,6 +381,7 @@ def directional_entry_zones(d):
         'long_is_countertrend': long_counter,
         'short_is_countertrend': short_counter,
         'entry_zone_min_separation_abs': min_sep,
+        'entry_zone_price_buffer_abs': price_buffer,
     }
 
 
@@ -460,6 +480,9 @@ def build_trade_report(d):
         'trigger_min_separation_abs': d.get('trigger_min_separation_abs'),
         'trigger_min_separation_pct': d.get('trigger_min_separation_pct'),
         'entry_zone_min_separation_abs': d.get('entry_zone_min_separation_abs'),
+        'entry_zone_price_buffer_abs': d.get('entry_zone_price_buffer_abs'),
+        'trigger_min_offset_from_price_abs': d.get('trigger_min_offset_from_price_abs'),
+        'trigger_min_offset_from_price_pct': d.get('trigger_min_offset_from_price_pct'),
         'setup_grade': 'B',
         'verdict': verdict,
     }
