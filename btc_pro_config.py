@@ -25,6 +25,7 @@ CME_BTC_BENCHMARK_URL = "https://www.cmegroup.com/markets/cryptocurrencies/cme-c
 BINANCE_URL_TICKER_24H = f"{BINANCE_BASE}/api/v3/ticker/24hr"
 BINANCE_URL_BOOK_TICKER = f"{BINANCE_BASE}/api/v3/ticker/bookTicker"
 BINANCE_URL_KLINES = f"{BINANCE_BASE}/api/v3/klines"
+BINANCE_URL_DEPTH = f"{BINANCE_BASE}/api/v3/depth"
 
 HISTORY_PATH = "~/btc_snapshot_history.jsonl"
 MAX_HISTORY_ROWS = 120
@@ -69,7 +70,7 @@ FIELD_SOURCE_PRIORITY = {
     "funding": ["bybit"],
     "open_interest": ["bybit"],
     "recent_trades": ["bybit"],
-    "orderbook": ["bybit"],
+    "orderbook": ["bybit", "binance"],
     "instrument_info": ["bybit"],
     "spot_ticker": ["binance", "bybit"],
     "spot_book": ["binance", "bybit"],
