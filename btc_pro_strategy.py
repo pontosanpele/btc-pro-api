@@ -296,7 +296,9 @@ def directional_entry_zones(d):
     ask = _f(d.get('largest_ask_wall_price'))
     vwap = _f(d.get('vwap_1h'))
     atr5 = max(_f(d.get('atr_5m')) or 0.0, 40.0)
+    atr15 = _f(d.get('atr_15m')) or atr5
     width = max(atr5 * 0.18, 20.0)
+    min_sep = max(_f(d.get('trigger_min_separation_abs')) or 0.0, atr15 * 0.55, 35.0)
 
     long_counter = d.get('dominant_bias_htf') == 'short'
     short_counter = d.get('dominant_bias_htf') == 'long'
@@ -329,9 +331,26 @@ def directional_entry_zones(d):
 
         short_main = short_cons or short_aggr
         if short_main and long_cons and short_main[0] <= long_cons[1]:
-            shift = max(width * 0.2, 8.0)
-            short_cons = _zone([max(short_cons[0], long_cons[1] + shift), max(short_cons[1], long_cons[1] + shift * 1.4)]) if short_cons else short_cons
+            shift = max(width * 0.2, 8.0, min_sep * 0.35)
+            short_cons = _zone([max(short_cons[0], long_cons[1] + shift), max(short_cons[1], long_cons[1] + shift * 1.5)]) if short_cons else short_cons
             short_main = short_cons or short_aggr
+
+    # Végső biztonsági szeparáció: a long és short fő zóna közepe között legyen HTF-hez igazított távolság.
+    if long_main and short_main:
+        long_mid = (long_main[0] + long_main[1]) / 2.0
+        short_mid = (short_main[0] + short_main[1]) / 2.0
+        if short_mid - long_mid < min_sep:
+            push = (min_sep - (short_mid - long_mid)) / 2.0
+            long_main = _zone([long_main[0] - push, long_main[1] - push])
+            short_main = _zone([short_main[0] + push, short_main[1] + push])
+            if long_aggr:
+                long_aggr = _zone([long_aggr[0] - push, long_aggr[1] - push])
+            if long_cons:
+                long_cons = _zone([long_cons[0] - push, long_cons[1] - push])
+            if short_aggr:
+                short_aggr = _zone([short_aggr[0] + push, short_aggr[1] + push])
+            if short_cons:
+                short_cons = _zone([short_cons[0] + push, short_cons[1] + push])
 
     return {
         'long_entry_zone': long_main,
@@ -342,6 +361,7 @@ def directional_entry_zones(d):
         'short_entry_zone_conservative': short_cons,
         'long_is_countertrend': long_counter,
         'short_is_countertrend': short_counter,
+        'entry_zone_min_separation_abs': min_sep,
     }
 
 
@@ -439,6 +459,7 @@ def build_trade_report(d):
         'liq_below_source_1': d.get('liq_below_source_1'),
         'trigger_min_separation_abs': d.get('trigger_min_separation_abs'),
         'trigger_min_separation_pct': d.get('trigger_min_separation_pct'),
+        'entry_zone_min_separation_abs': d.get('entry_zone_min_separation_abs'),
         'setup_grade': 'B',
         'verdict': verdict,
     }
