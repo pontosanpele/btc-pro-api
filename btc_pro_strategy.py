@@ -465,9 +465,42 @@ def _trade_plan_confidence(d, side):
     return round(clamp(base, 0, 100), 2)
 
 
+def _liquidity_flip_guard(d, side):
+    prev_side = d.get('prev_trade_bias')
+    if side not in ('long', 'short'):
+        return side, None
+    if prev_side not in ('long', 'short') or prev_side == side:
+        return side, None
+
+    liq_sup_strength = _f(d.get('liquidity_support_strength')) or 0.0
+    liq_res_strength = _f(d.get('liquidity_resistance_strength')) or 0.0
+    liq_sup_dist = _f(d.get('liquidity_support_distance_pct'))
+    liq_res_dist = _f(d.get('liquidity_resistance_distance_pct'))
+
+    strong_long_confirmation = (
+        liq_sup_strength >= 1.45 and
+        liq_sup_dist is not None and
+        0 <= liq_sup_dist <= 0.45
+    )
+    strong_short_confirmation = (
+        liq_res_strength >= 1.45 and
+        liq_res_dist is not None and
+        0 <= liq_res_dist <= 0.45
+    )
+
+    if side == 'long' and not strong_long_confirmation:
+        return prev_side, 'flip_blocked_wait_stronger_bid_liquidity'
+    if side == 'short' and not strong_short_confirmation:
+        return prev_side, 'flip_blocked_wait_stronger_ask_liquidity'
+    return side, None
+
+
 def trade_plan_generator(d):
     side = d.get('trade_bias')
     cancel = []
+    side, flip_reason = _liquidity_flip_guard(d, side)
+    if flip_reason:
+        cancel.append(flip_reason)
     if d.get('trade_plan_invalidated'):
         side = 'no_trade'
         cancel.append('trade_plan_invalidated')
