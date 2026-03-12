@@ -434,6 +434,11 @@ def build_trade_report(d):
         'liquidity_resistance_strength': d.get('liquidity_resistance_strength'),
         'liquidity_support_strength': d.get('liquidity_support_strength'),
         'source_orderbook': d.get('source_orderbook_resolved') or d.get('source_orderbook'),
+        'prev_trade_bias': d.get('prev_trade_bias'),
+        'liq_above_source_1': d.get('liq_above_source_1'),
+        'liq_below_source_1': d.get('liq_below_source_1'),
+        'trigger_min_separation_abs': d.get('trigger_min_separation_abs'),
+        'trigger_min_separation_pct': d.get('trigger_min_separation_pct'),
         'setup_grade': 'B',
         'verdict': verdict,
     }
