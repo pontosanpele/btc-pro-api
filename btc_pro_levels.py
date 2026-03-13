@@ -5,29 +5,75 @@ def liquidity_map_proxy(d):
     above = []
     below = []
     last = d.get('last')
-    for key in ['prev_5m_high', 'prev_15m_high', 'swing_high_12x5m', 'vwap_24h']:
+
+    # 15m + 1h szerkezeti/liquidity jelöltek, 1h nagyobb súllyal.
+    above_keys = [
+        ('prev_5m_high', 1.0),
+        ('prev_15m_high', 1.25),
+        ('prev_1h_high', 1.85),
+        ('swing_high_12x5m', 1.1),
+        ('vwap_1h', 1.4),
+        ('vwap_24h', 1.8),
+    ]
+    below_keys = [
+        ('prev_5m_low', 1.0),
+        ('prev_15m_low', 1.25),
+        ('prev_1h_low', 1.85),
+        ('swing_low_12x5m', 1.1),
+        ('vwap_1h', 1.4),
+        ('vwap_24h', 1.8),
+    ]
+
+    for key, weight in above_keys:
         v = d.get(key)
         if v is not None and last is not None and v > last:
-            above.append((abs(v - last), v))
-    for key in ['prev_5m_low', 'prev_15m_low', 'swing_low_12x5m', 'vwap_24h', 'vwap_1h']:
+            dist = abs(v - last)
+            above.append((dist / weight, v, key))
+
+    for key, weight in below_keys:
         v = d.get(key)
         if v is not None and last is not None and v < last:
-            below.append((abs(v - last), v))
+            dist = abs(v - last)
+            below.append((dist / weight, v, key))
+
     above.sort(key=lambda x: x[0])
     below.sort(key=lambda x: x[0])
+
     liq_above_1 = above[0][1] if len(above) > 0 else None
     liq_above_2 = above[1][1] if len(above) > 1 else None
     liq_below_1 = below[0][1] if len(below) > 0 else None
     liq_below_2 = below[1][1] if len(below) > 1 else None
+
+    # HTF célárak külön: 1h/24h alapú likviditás és 15m főbb szintek.
+    htf_above_candidates = [
+        d.get('vwap_24h'),
+        d.get('vwap_1h'),
+        d.get('prev_1h_high'),
+        d.get('prev_15m_high'),
+    ]
+    htf_below_candidates = [
+        d.get('vwap_24h'),
+        d.get('vwap_1h'),
+        d.get('prev_1h_low'),
+        d.get('prev_15m_low'),
+    ]
+    htf_above = min([x for x in htf_above_candidates if x is not None and last is not None and x > last], default=None)
+    htf_below = max([x for x in htf_below_candidates if x is not None and last is not None and x < last], default=None)
+
     nearest = 'neutral'
     if last is not None and liq_above_1 is not None and liq_below_1 is not None:
         nearest = 'above' if abs(liq_above_1 - last) < abs(last - liq_below_1) else 'below'
+
     return {
         'liq_above_1': liq_above_1,
         'liq_above_2': liq_above_2,
         'liq_below_1': liq_below_1,
         'liq_below_2': liq_below_2,
+        'liq_above_htf': htf_above,
+        'liq_below_htf': htf_below,
         'nearest_liquidity_side': nearest,
+        'liq_above_source_1': above[0][2] if above else None,
+        'liq_below_source_1': below[0][2] if below else None,
     }
 
 
@@ -40,8 +86,8 @@ def _safe_ratio(a, b):
 
 def orderbook_wall_tracker(d):
     mid = d.get('orderbook_mid')
-    bid_wall = d.get('liq_below_1')
-    ask_wall = d.get('liq_above_1')
+    bid_wall = d.get('largest_bid_wall_price') or d.get('liq_below_1')
+    ask_wall = d.get('largest_ask_wall_price') or d.get('liq_above_1')
     ob = d.get('orderbook_imbalance_0_25_pct')
     bid_usd = d.get('largest_bid_wall_usd')
     ask_usd = d.get('largest_ask_wall_usd')
@@ -125,15 +171,51 @@ def orderbook_wall_tracker(d):
 
 def trigger_engine(d):
     last = d.get('last')
-    bull_trigger = d.get('liq_above_1') or d.get('prev_15m_high') or d.get('prev_5m_high')
-    bear_trigger = d.get('liq_below_1') or d.get('prev_15m_low') or d.get('prev_5m_low')
+    # Entry-side anchors:
+    # - LONG mindig ár alatti liquidity zónához igazodjon
+    # - SHORT mindig ár feletti liquidity zónához igazodjon
+    bull_trigger = d.get('liq_below_htf') or d.get('prev_1h_low') or d.get('liq_below_1') or d.get('prev_15m_low') or d.get('prev_5m_low')
+    bear_trigger = d.get('liq_above_htf') or d.get('prev_1h_high') or d.get('liq_above_1') or d.get('prev_15m_high') or d.get('prev_5m_high')
     swing_high = d.get('swing_high_12x5m')
     swing_low = d.get('swing_low_12x5m')
     atr5 = d.get('atr_5m')
     atr15 = d.get('atr_15m')
+
+    # Ne legyen túl közel egymáshoz a long/short belépő: 15m ATR + minimum %-os sáv.
+    min_gap = None
+    min_offset_from_price = None
+    if last is not None:
+        atr15_base = atr15 if atr15 is not None else 0.0
+        min_gap = max(atr15_base * 0.95, last * 0.0048)
+        min_offset_from_price = max(atr15_base * 0.55, last * 0.0028)
+
+    # Kreatív stabilizáció: az entry-triggerek ne legyenek túl közel a pillanatnyi árhoz.
+    if None not in (last, bull_trigger, min_offset_from_price):
+        bull_trigger = min(bull_trigger, last - min_offset_from_price)
+    if None not in (last, bear_trigger, min_offset_from_price):
+        bear_trigger = max(bear_trigger, last + min_offset_from_price)
+
+    # A long (bull_trigger) legyen a short (bear_trigger) alatt legalább min_gap távolsággal.
+    if None not in (bull_trigger, bear_trigger, min_gap) and bear_trigger <= bull_trigger + min_gap:
+        htf_up = d.get('liq_above_htf') or d.get('vwap_24h') or d.get('prev_1h_high') or d.get('prev_15m_high')
+        htf_dn = d.get('liq_below_htf') or d.get('vwap_1h') or d.get('prev_1h_low') or d.get('prev_15m_low')
+
+        if htf_dn is not None and htf_dn < bear_trigger:
+            bull_trigger = min(bull_trigger, htf_dn)
+        if htf_up is not None and htf_up > bull_trigger:
+            bear_trigger = max(bear_trigger, htf_up)
+
+        if None not in (bull_trigger, bear_trigger, min_gap) and bear_trigger <= bull_trigger + min_gap and last is not None:
+            bull_trigger = min(bull_trigger, last - min_gap * 0.5)
+            bear_trigger = max(bear_trigger, last + min_gap * 0.5)
+
     return {
         'bull_trigger_price': bull_trigger,
         'bear_trigger_price': bear_trigger,
+        'trigger_min_separation_abs': min_gap,
+        'trigger_min_separation_pct': (min_gap / last * 100.0) if None not in (min_gap, last) and last != 0 else None,
+        'trigger_min_offset_from_price_abs': min_offset_from_price,
+        'trigger_min_offset_from_price_pct': (min_offset_from_price / last * 100.0) if None not in (min_offset_from_price, last) and last != 0 else None,
         'invalidation_long': swing_low,
         'invalidation_short': swing_high,
         'atr_stop_long': last - atr5 * 1.2 if None not in (last, atr5) else None,
@@ -154,10 +236,12 @@ def trigger_acceptance(d):
     lower = d.get('cur5m_lower_wick_pct_of_range') or 0.0
     above = False
     below = False
-    if None not in (last, long_trigger):
-        above = last > long_trigger and body5 > 35 and upper < 55
-    if None not in (last, short_trigger):
-        below = last < short_trigger and body5 > 35 and lower < 55
+    if None not in (last, long_trigger) and last != 0:
+        long_dist_pct = abs(last - long_trigger) / last * 100.0
+        above = long_trigger < last and long_dist_pct <= 0.80 and body5 > 35 and upper < 55
+    if None not in (last, short_trigger) and last != 0:
+        short_dist_pct = abs(short_trigger - last) / last * 100.0
+        below = short_trigger > last and short_dist_pct <= 0.80 and body5 > 35 and lower < 55
     return {'above_long_trigger_acceptance': above, 'below_short_trigger_acceptance': below}
 
 

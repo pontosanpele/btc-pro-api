@@ -3,6 +3,7 @@ from collections import deque
 from statistics import median
 from btc_pro_config import (
     BINANCE_URL_BOOK_TICKER,
+    BINANCE_URL_DEPTH,
     BINANCE_URL_KLINES,
     BINANCE_URL_TICKER_24H,
     CME_BTC_BENCHMARK_URL,
@@ -265,22 +266,67 @@ def all_oi(symbol=SYMBOL_PERP):
     return out
 
 
-def orderbook(category, symbol, limit=200):
-    ob = req_bybit(URL_ORDERBOOK, {'category': category, 'symbol': symbol, 'limit': limit})['result']
-    bids = [(f(x[0]), f(x[1])) for x in ob['b']]; asks = [(f(x[0]), f(x[1])) for x in ob['a']]
-    bids = [(p, q) for p, q in bids if p is not None and q is not None]; asks = [(p, q) for p, q in asks if p is not None and q is not None]
-    if not bids or not asks: return {}
+def _book_stats(bids, asks, source_name):
+    bids = [(p, q) for p, q in bids if p is not None and q is not None]
+    asks = [(p, q) for p, q in asks if p is not None and q is not None]
+    if not bids or not asks:
+        return {}
     mid = (bids[0][0] + asks[0][0]) / 2.0
+
     def depth_notional(side_rows, pct_band, side):
-        total = 0.0; thr = mid * (1 - pct_band / 100.0) if side == 'bid' else mid * (1 + pct_band / 100.0)
+        total = 0.0
+        thr = mid * (1 - pct_band / 100.0) if side == 'bid' else mid * (1 + pct_band / 100.0)
         for p, q in side_rows:
-            if (side == 'bid' and p >= thr) or (side == 'ask' and p <= thr): total += p * q
+            if (side == 'bid' and p >= thr) or (side == 'ask' and p <= thr):
+                total += p * q
         return total
+
     def imbalance(pct_band):
-        b = depth_notional(bids, pct_band, 'bid'); a = depth_notional(asks, pct_band, 'ask')
-        if (a + b) == 0: return None
+        b = depth_notional(bids, pct_band, 'bid')
+        a = depth_notional(asks, pct_band, 'ask')
+        if (a + b) == 0:
+            return None
         return (b - a) / (b + a) * 100.0
-    return {'orderbook_mid': mid, 'orderbook_imbalance_0_10_pct': imbalance(0.10), 'orderbook_imbalance_0_25_pct': imbalance(0.25), 'orderbook_imbalance_0_50_pct': imbalance(0.50), 'orderbook_imbalance_1_00_pct': imbalance(1.00), 'source_orderbook': 'bybit'}
+
+    bid_wall_price, bid_wall_usd = max(((p, p * q) for p, q in bids[:40]), key=lambda x: x[1], default=(None, None))
+    ask_wall_price, ask_wall_usd = max(((p, p * q) for p, q in asks[:40]), key=lambda x: x[1], default=(None, None))
+    return {
+        'orderbook_mid': mid,
+        'orderbook_imbalance_0_10_pct': imbalance(0.10),
+        'orderbook_imbalance_0_25_pct': imbalance(0.25),
+        'orderbook_imbalance_0_50_pct': imbalance(0.50),
+        'orderbook_imbalance_1_00_pct': imbalance(1.00),
+        'largest_bid_wall_price': bid_wall_price,
+        'largest_ask_wall_price': ask_wall_price,
+        'largest_bid_wall_usd': bid_wall_usd,
+        'largest_ask_wall_usd': ask_wall_usd,
+        'source_orderbook': source_name,
+    }
+
+
+def bybit_orderbook(category, symbol, limit=200):
+    ob = req_bybit(URL_ORDERBOOK, {'category': category, 'symbol': symbol, 'limit': limit})['result']
+    bids = [(f(x[0]), f(x[1])) for x in ob.get('b', [])]
+    asks = [(f(x[0]), f(x[1])) for x in ob.get('a', [])]
+    return _book_stats(bids, asks, 'bybit')
+
+
+def binance_orderbook(symbol, limit=200):
+    ob = req_binance(BINANCE_URL_DEPTH, {'symbol': symbol, 'limit': min(limit, 1000)})
+    bids = [(f(x[0]), f(x[1])) for x in ob.get('bids', [])]
+    asks = [(f(x[0]), f(x[1])) for x in ob.get('asks', [])]
+    return _book_stats(bids, asks, 'binance')
+
+
+def orderbook(category, symbol, limit=200):
+    routed, source = resolve_route(
+        'orderbook',
+        {
+            'bybit': lambda: bybit_orderbook(category, symbol, limit),
+            'binance': lambda: binance_orderbook(symbol, limit),
+        },
+    )
+    return attach_source(routed, source, 'orderbook')
 
 
 def recent_trades(category, symbol, limit=1000):
@@ -354,9 +400,10 @@ def volume_and_structure(category, symbol):
     medr5 = median_range_ex_current(k5, 20); medr15 = median_range_ex_current(k15, 20)
     cur5r = None if not cur5 else (cur5['high'] - cur5['low']); cur15r = None if not cur15 else (cur15['high'] - cur15['low'])
     prev5_high = k5[1]['high'] if len(k5) > 1 else None; prev5_low = k5[1]['low'] if len(k5) > 1 else None; prev15_high = k15[1]['high'] if len(k15) > 1 else None; prev15_low = k15[1]['low'] if len(k15) > 1 else None
+    prev1h_high = k60[1]['high'] if len(k60) > 1 else None; prev1h_low = k60[1]['low'] if len(k60) > 1 else None
     highs = [c['high'] for c in k5[:12] if c['high'] is not None]; lows = [c['low'] for c in k5[:12] if c['low'] is not None]
     vwap1 = calc_vwap(k5[:12]); vwap24 = calc_vwap(k60[:24]); last = cur5['close'] if cur5 else None
-    out = {'turnover_5m_usd': t5, 'turnover_15m_usd': t15, 'turnover_1h_usd': t60, 'median_turnover_5m_usd': med5, 'median_turnover_15m_usd': med15, 'median_turnover_1h_usd': med60, 'volume_spike_5m_x': safe_div(t5, med5), 'volume_spike_15m_x': safe_div(t15, med15), 'volume_spike_1h_x': safe_div(t60, med60), 'range_5m': cur5r, 'range_15m': cur15r, 'median_range_5m': medr5, 'median_range_15m': medr15, 'range_expansion_5m_x': safe_div(cur5r, medr5), 'range_expansion_15m_x': safe_div(cur15r, medr15), 'prev_5m_high': prev5_high, 'prev_5m_low': prev5_low, 'prev_15m_high': prev15_high, 'prev_15m_low': prev15_low, 'swing_high_12x5m': max(highs) if highs else None, 'swing_low_12x5m': min(lows) if lows else None, 'vwap_1h': vwap1, 'vwap_24h': vwap24, 'price_vs_vwap_1h_pct': pct(last, vwap1), 'price_vs_vwap_24h_pct': pct(last, vwap24), 'atr_5m': calc_atr(k5, 14), 'atr_15m': calc_atr(k15, 14), 'price_low_2_5m': min([c['low'] for c in k5[:2] if c['low'] is not None], default=None), 'price_low_6_5m': min([c['low'] for c in k5[1:7] if c['low'] is not None], default=None), 'price_high_2_5m': max([c['high'] for c in k5[:2] if c['high'] is not None], default=None), 'price_high_6_5m': max([c['high'] for c in k5[1:7] if c['high'] is not None], default=None), 'vol_declining_5m': True if len(k5) > 2 and all(k5[i]['turnover'] <= k5[i+1]['turnover'] for i in range(0, 2) if None not in (k5[i]['turnover'], k5[i+1]['turnover'])) else False, 'source_structure': 'bybit'}
+    out = {'turnover_5m_usd': t5, 'turnover_15m_usd': t15, 'turnover_1h_usd': t60, 'median_turnover_5m_usd': med5, 'median_turnover_15m_usd': med15, 'median_turnover_1h_usd': med60, 'volume_spike_5m_x': safe_div(t5, med5), 'volume_spike_15m_x': safe_div(t15, med15), 'volume_spike_1h_x': safe_div(t60, med60), 'range_5m': cur5r, 'range_15m': cur15r, 'median_range_5m': medr5, 'median_range_15m': medr15, 'range_expansion_5m_x': safe_div(cur5r, medr5), 'range_expansion_15m_x': safe_div(cur15r, medr15), 'prev_5m_high': prev5_high, 'prev_5m_low': prev5_low, 'prev_15m_high': prev15_high, 'prev_15m_low': prev15_low, 'prev_1h_high': prev1h_high, 'prev_1h_low': prev1h_low, 'swing_high_12x5m': max(highs) if highs else None, 'swing_low_12x5m': min(lows) if lows else None, 'vwap_1h': vwap1, 'vwap_24h': vwap24, 'price_vs_vwap_1h_pct': pct(last, vwap1), 'price_vs_vwap_24h_pct': pct(last, vwap24), 'atr_5m': calc_atr(k5, 14), 'atr_15m': calc_atr(k15, 14), 'price_low_2_5m': min([c['low'] for c in k5[:2] if c['low'] is not None], default=None), 'price_low_6_5m': min([c['low'] for c in k5[1:7] if c['low'] is not None], default=None), 'price_high_2_5m': max([c['high'] for c in k5[:2] if c['high'] is not None], default=None), 'price_high_6_5m': max([c['high'] for c in k5[1:7] if c['high'] is not None], default=None), 'vol_declining_5m': True if len(k5) > 2 and all(k5[i]['turnover'] <= k5[i+1]['turnover'] for i in range(0, 2) if None not in (k5[i]['turnover'], k5[i+1]['turnover'])) else False, 'source_structure': 'bybit'}
     out.update({f'cur5m_{k}': v for k, v in candle_metrics(cur5).items()}); out.update({f'cur15m_{k}': v for k, v in candle_metrics(cur15).items()})
     return out
 
